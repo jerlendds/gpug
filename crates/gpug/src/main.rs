@@ -5,14 +5,13 @@ use gpui::{
 };
 
 impl Render for Graph {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, graph_cx: &mut Context<Self>) -> impl IntoElement {
         // Batched edges canvas: draw all edges in a single paint pass
         let edge_pairs = self.edge_pairs.clone();
         let nodes_for_edges = self.nodes.clone();
         let zoom = self.zoom;
         let pan = self.pan;
-        let graph_entity = cx.entity();
-        let graph_id = graph_entity.entity_id();
+        let graph_entity = graph_cx.entity();
         let edges_canvas = canvas(
             move |_bounds, _window, _cx| (),
             move |_bounds, _state, window, cx| {
@@ -64,7 +63,7 @@ impl Render for Graph {
         let edge_pairs = self.edge_pairs.clone();
         let sim_canvas = canvas(
             move |_bounds, _window, _cx| (),
-            move |_bounds, _state, _window, cx| {
+            move |_bounds, _state, window, cx| {
                 let playing = cx.read_entity(&graph_handle, |g: &Graph, _| g.playing);
                 if !playing {
                     return;
@@ -73,6 +72,8 @@ impl Render for Graph {
                 if n == 0 {
                     return;
                 }
+
+                window.request_animation_frame();
 
                 // Read positions
                 let mut xs: Vec<f32> = Vec::with_capacity(n);
@@ -127,7 +128,7 @@ impl Render for Graph {
                                 }
                                 let dx = xs[j] - xs[i];
                                 let dy = ys[j] - ys[i];
-                                let mut d2 = dx * dx + dy * dy + 0.01;
+                                let d2 = dx * dx + dy * dy + 0.01;
                                 let inv = 1.0 / d2;
                                 let fx_ij = repulsion * dx * inv;
                                 let fy_ij = repulsion * dy * inv;
@@ -187,7 +188,7 @@ impl Render for Graph {
                         node.y = ny;
                     });
                 }
-                // Schedule next frame: nudge state and request another pass
+                // Bookkeep a tick so any observers can react and mark the graph dirty
                 cx.update_entity(&graph_handle, |g: &mut Graph, _| {
                     g.sim_tick = g.sim_tick.wrapping_add(1);
                 });
@@ -212,7 +213,7 @@ impl Render for Graph {
             .border_color(rgb(0xcccccc))
             .on_mouse_down(
                 gpui::MouseButton::Left,
-                cx.listener({
+                graph_cx.listener({
                     move |this, _e: &gpui::MouseDownEvent, _w, cx| {
                         this.playing = !this.playing;
                         cx.notify();
@@ -227,7 +228,7 @@ impl Render for Graph {
             // Clicking selects node under cursor; shift adds to selection; clicking empty space clears
             .on_mouse_down(
                 gpui::MouseButton::Left,
-                cx.listener(|this, e: &gpui::MouseDownEvent, _w, cx| {
+                graph_cx.listener(|this, e: &gpui::MouseDownEvent, _w, cx| {
                     let cursor = e.position;
                     let mut hit_index: Option<usize> = None;
                     for (i, n) in this.nodes.iter().enumerate() {
@@ -268,8 +269,7 @@ impl Render for Graph {
                     // selection updates above trigger re-render
                 }),
             )
-            .on_scroll_wheel(cx.listener({
-                let graph_id = graph_id;
+            .on_scroll_wheel(graph_cx.listener({
                 move |this, event: &gpui::ScrollWheelEvent, _window, cx| {
                     let delta_px = event.delta.pixel_delta(px(16.0));
                     let dy = delta_px.y;
@@ -354,7 +354,7 @@ impl Render for GpugNode {
                     }
                 }),
             )
-            .on_drop(cx.listener(|this, dragged_id: &u64, _window, cx| {
+            .on_drop(cx.listener(|this, dragged_id: &u64, _window, _cx| {
                 if *dragged_id == this.id {
                     this.drag_offset = None;
                 }
@@ -397,7 +397,7 @@ type GraphEdges = Vec<Entity<GpugEdge>>;
 // Root view that hosts nodes
 struct Graph {
     nodes: GraphNodes,
-    edges: GraphEdges,
+    // edges: GraphEdges,
     edge_pairs: Vec<(usize, usize)>,
     sim_tick: u64,
     zoom: f32,
@@ -409,10 +409,10 @@ impl Graph {
     fn new(cx: &mut App, total_nodes: usize, random_link_chance: f32) -> Self {
         // Create a random graph: N nodes, edges with probability p
         let nodes: Vec<Entity<GpugNode>> = generate_nodes(cx, total_nodes);
-        let (edges, edge_pairs) = randomly_link_nodes_with_pairs(cx, &nodes, random_link_chance);
+        let (_edges, edge_pairs) = randomly_link_nodes_with_pairs(cx, &nodes, random_link_chance);
         Self {
             nodes,
-            edges,
+            // edges,
             edge_pairs,
             sim_tick: 0,
             zoom: 1.0,
