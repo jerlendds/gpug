@@ -6,10 +6,50 @@ use gpui::{
 
 impl Render for Graph {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Batched edges canvas: draw all edges in a single paint pass
+        let edge_pairs = self.edge_pairs.clone();
+        let nodes_for_edges = self.nodes.clone();
+        let zoom = self.zoom;
+        let pan = self.pan;
+        let edges_canvas = canvas(
+            move |_bounds, _window, _cx| (),
+            move |_bounds, _state, window, cx| {
+                let mut path = gpui::Path::new(point(px(0.0), px(0.0)));
+                let thickness = (0.5f32 * zoom).max(0.5);
+                for &(i, j) in &edge_pairs {
+                    if i >= nodes_for_edges.len() || j >= nodes_for_edges.len() {
+                        continue;
+                    }
+                    let (x1, y1) = cx.read_entity(&nodes_for_edges[i], |n, _| (n.x + px(8.0), n.y + px(8.0)));
+                    let (x2, y2) = cx.read_entity(&nodes_for_edges[j], |n, _| (n.x + px(8.0), n.y + px(8.0)));
+
+                    let p1 = point(pan.x + x1 * zoom, pan.y + y1 * zoom);
+                    let p2 = point(pan.x + x2 * zoom, pan.y + y2 * zoom);
+                    let dir = point(p2.x - p1.x, p2.y - p1.y);
+                    let len = dir.magnitude() as f32;
+                    if len <= 0.0001 { continue; }
+                    let half_thickness: f32 = thickness as f32;
+                    let normal = point(-dir.y, dir.x) * (half_thickness / len);
+
+                    let p1a = point(p1.x + normal.x, p1.y + normal.y);
+                    let p1b = point(p1.x - normal.x, p1.y - normal.y);
+                    let p2a = point(p2.x + normal.x, p2.y + normal.y);
+                    let p2b = point(p2.x - normal.x, p2.y - normal.y);
+
+                    let st = (point(0., 1.), point(0., 1.), point(0., 1.));
+                    path.push_triangle((p1a, p1b, p2a), st);
+                    path.push_triangle((p2a, p1b, p2b), st);
+                }
+                window.paint_path(path, rgb(0x323232));
+            },
+        )
+        .absolute()
+        .size_full();
+
+        // Node entities render above edges
         let graph_canvas = div()
             .size_full()
-            // Paint edges first so nodes render above lines
-            .children(self.edges.iter().cloned())
+            .child(edges_canvas)
             .children(self.nodes.iter().cloned());
 
         // Simulation canvas: runs a physics step per frame when playing
@@ -242,14 +282,6 @@ impl Render for Graph {
                             cx.update_entity(n, move |node, _| {
                                 node.zoom = zoom;
                                 node.pan = pan;
-                            });
-                        }
-                        for e in &this.edges {
-                            let pan = this.pan;
-                            let zoom = this.zoom;
-                            cx.update_entity(e, move |edge, _| {
-                                edge.zoom = zoom;
-                                edge.pan = pan;
                             });
                         }
                         // zoom/pan updates above trigger re-render
