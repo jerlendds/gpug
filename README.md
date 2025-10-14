@@ -6,7 +6,7 @@
   </a>
 
   <h3 align="left">
-    GPUG: A GPU-accelerated graph visualization engine built with Zed’s GPUI, exploring how far Rust and the GPUI can take interactive graph rendering.
+    GPUG: A GPU-accelerated graph visualization engine built with Zed’s GPUI, exploring how far Rust and Zed's GPUI can take interactive graph rendering.
   </h3>
 
 
