@@ -66,8 +66,8 @@ Created with Create GPUI App, to get started with GPUI visit the GPUI documentat
 | **Proof-of-concept** | Is it possible to render interactive network graphs with GPUI? | true |
 | **Built-in Node & Edge Types** | GPUG ships with default node and edge types (e.g. `default`, `smoothstep`, `step`, `straight`) but supports full customization. | false |
 | **Custom Nodes & Edges** | You can define fully custom nodes (with arbitrary rendering, embedded elements) and edges with custom behavior and style. | false |
-| **Handles / Ports** | Connection handles (ports) can be placed on any side or position, styled arbitrarily, enabling multiple inputs/outputs per node. | false |
-| **Interactive Connection / Drag to Connect** | Users can drag from one handle to another to create new edges, with placeholder "connection line" behavior. | false |
+| **Handles** | Connection handles can be placed on any side or position, styled arbitrarily, enabling multiple inputs/outputs per node. | false |
+| **Interactive Connections** | Users can drag from one handle to another to create new edges. | false |
 | **Viewport Control & Animation** | GPUG supports controlling the viewport (position, zoom) programmatically, and animating or constraining transforms. | false |
 | **Minimap, Controls, Background** | Out-of-the-box UI components like a minimap, pan/zoom controls, and grid background are included. | false |
 | **Animating Node / Edge Properties** | You can animate transitions of color, size, or position of nodes/edges. | false |
