@@ -2,7 +2,7 @@
 
 <p dir="auto">
   <a href="https://github.com/jerlendds/gpug">
-    <img src="./logo.png" height="220px" alt="GPUG logo" align="left" />
+    <img src="./logo.svg" height="220px" alt="GPUG logo" align="left" />
   </a>
 
   <h3 align="left">
