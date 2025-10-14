@@ -3,28 +3,27 @@ use gpui::{
     canvas, div, Application, Context, IntoElement, ParentElement, Render, Styled, Window,
     WindowOptions,
 };
+use std::collections::HashSet;
 
 impl Render for Graph {
     fn render(&mut self, _window: &mut Window, graph_cx: &mut Context<Self>) -> impl IntoElement {
         // Batched edges canvas: draw all edges in a single paint pass
-        let edge_pairs = self.edge_pairs.clone();
-        let nodes_for_edges = self.nodes.clone();
         let zoom = self.zoom;
         let pan = self.pan;
+        let nodes = self.nodes.clone();
+        let edge_pairs = self.edge_pairs.clone();
         let graph_entity = graph_cx.entity();
         let edges_canvas = canvas(
-            move |_bounds, _window, _cx| (),
+            |_bounds, _window, _cx| (),
             move |_bounds, _state, window, cx| {
                 let mut path = gpui::Path::new(point(px(0.0), px(0.0)));
                 let thickness = (0.5f32 * zoom).max(0.5);
                 for &(i, j) in &edge_pairs {
-                    if i >= nodes_for_edges.len() || j >= nodes_for_edges.len() {
+                    if i >= nodes.len() || j >= nodes.len() {
                         continue;
                     }
-                    let (x1, y1) =
-                        cx.read_entity(&nodes_for_edges[i], |n, _| (n.x + px(8.0), n.y + px(8.0)));
-                    let (x2, y2) =
-                        cx.read_entity(&nodes_for_edges[j], |n, _| (n.x + px(8.0), n.y + px(8.0)));
+                    let (x1, y1) = cx.read_entity(&nodes[i], |n, _| (n.x + px(8.0), n.y + px(8.0)));
+                    let (x2, y2) = cx.read_entity(&nodes[j], |n, _| (n.x + px(8.0), n.y + px(8.0)));
 
                     let p1 = point(pan.x + x1 * zoom, pan.y + y1 * zoom);
                     let p2 = point(pan.x + x2 * zoom, pan.y + y2 * zoom);
@@ -255,7 +254,6 @@ impl Render for Graph {
                                 }
                             }
                             let target = this.nodes[i].clone();
-                            cx.update_entity(&target, |_node, _| {}); // ensure entity exists
                             cx.update_entity(&target, |node, _| {
                                 node.selected = true;
                             });
@@ -266,7 +264,6 @@ impl Render for Graph {
                             }
                         }
                     }
-                    // selection updates above trigger re-render
                 }),
             )
             .on_scroll_wheel(graph_cx.listener({
@@ -560,10 +557,93 @@ fn randomly_link_nodes_with_pairs(
     (edges, pairs)
 }
 
+fn generate_watts_strogatz_graph(n: usize, k: usize, beta: f32) -> Vec<(usize, usize)> {
+    if n < 2 {
+        return Vec::new();
+    }
+
+    let max_k = (n - 1) / 2;
+    let effective_k = k.min(max_k.max(1));
+    if effective_k == 0 {
+        return Vec::new();
+    }
+
+    let rewiring_prob = beta.clamp(0.0, 1.0);
+
+    let mut seed: u64 = 0xBADC0FFE_E0DDF00D;
+    let mut adjacency: Vec<HashSet<usize>> = (0..n)
+        .map(|_| HashSet::with_capacity(effective_k * 2))
+        .collect();
+    let mut targets: Vec<Vec<usize>> = (0..n).map(|_| Vec::with_capacity(effective_k)).collect();
+
+    // Build the initial ring lattice connecting each node to its next `k` neighbors
+    for source in 0..n {
+        for offset in 1..=effective_k {
+            let target = (source + offset) % n;
+            if adjacency[source].insert(target) {
+                adjacency[target].insert(source);
+            }
+            targets[source].push(target);
+        }
+    }
+
+    if rewiring_prob > 0.0 {
+        let attempt_cap = n * 8;
+        for source in 0..n {
+            let degree = targets[source].len();
+            for edge_index in 0..degree {
+                if rand_f32(&mut seed) >= rewiring_prob {
+                    continue;
+                }
+
+                let old_target = targets[source][edge_index];
+                adjacency[source].remove(&old_target);
+                adjacency[old_target].remove(&source);
+
+                let mut new_target = old_target;
+                let mut attempts = 0usize;
+                loop {
+                    attempts += 1;
+                    if attempts > attempt_cap {
+                        adjacency[source].insert(old_target);
+                        adjacency[old_target].insert(source);
+                        break;
+                    }
+                    let mut candidate = (rand_f32(&mut seed) * n as f32) as usize;
+                    if candidate >= n {
+                        candidate = n - 1;
+                    }
+                    if candidate == source {
+                        continue;
+                    }
+                    if adjacency[source].contains(&candidate) {
+                        continue;
+                    }
+                    adjacency[source].insert(candidate);
+                    adjacency[candidate].insert(source);
+                    new_target = candidate;
+                    break;
+                }
+                targets[source][edge_index] = new_target;
+            }
+        }
+    }
+
+    let mut edge_pairs = Vec::with_capacity(n * effective_k);
+    for source in 0..n {
+        for &target in &adjacency[source] {
+            if source < target {
+                edge_pairs.push((source, target));
+            }
+        }
+    }
+    edge_pairs
+}
+
 fn main() {
     Application::new().run(|cx: &mut App| {
         cx.open_window(WindowOptions::default(), |_, cx| {
-            cx.new(|cx| Graph::new(cx, 100, 0.04))
+            cx.new(|cx| Graph::new(cx, 100, 0.005))
         })
         .unwrap();
     });
