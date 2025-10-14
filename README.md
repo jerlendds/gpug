@@ -1,6 +1,6 @@
-<p>
+<p dir="auto">
   <a href="https://github.com/jerlendds/gpug">
-    <img src="./logo.png" height="226px" alt="GPUG logo" />
+    <img src="./logo.png" height="320px" alt="GPUG logo" align="right" />
   </a>
 </p>
 
