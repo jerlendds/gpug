@@ -11,6 +11,8 @@ impl Render for Graph {
         let nodes_for_edges = self.nodes.clone();
         let zoom = self.zoom;
         let pan = self.pan;
+        let graph_entity = cx.entity();
+        let graph_id = graph_entity.entity_id();
         let edges_canvas = canvas(
             move |_bounds, _window, _cx| (),
             move |_bounds, _state, window, cx| {
@@ -20,14 +22,18 @@ impl Render for Graph {
                     if i >= nodes_for_edges.len() || j >= nodes_for_edges.len() {
                         continue;
                     }
-                    let (x1, y1) = cx.read_entity(&nodes_for_edges[i], |n, _| (n.x + px(8.0), n.y + px(8.0)));
-                    let (x2, y2) = cx.read_entity(&nodes_for_edges[j], |n, _| (n.x + px(8.0), n.y + px(8.0)));
+                    let (x1, y1) =
+                        cx.read_entity(&nodes_for_edges[i], |n, _| (n.x + px(8.0), n.y + px(8.0)));
+                    let (x2, y2) =
+                        cx.read_entity(&nodes_for_edges[j], |n, _| (n.x + px(8.0), n.y + px(8.0)));
 
                     let p1 = point(pan.x + x1 * zoom, pan.y + y1 * zoom);
                     let p2 = point(pan.x + x2 * zoom, pan.y + y2 * zoom);
                     let dir = point(p2.x - p1.x, p2.y - p1.y);
                     let len = dir.magnitude() as f32;
-                    if len <= 0.0001 { continue; }
+                    if len <= 0.0001 {
+                        continue;
+                    }
                     let half_thickness: f32 = thickness as f32;
                     let normal = point(-dir.y, dir.x) * (half_thickness / len);
 
@@ -53,7 +59,7 @@ impl Render for Graph {
             .children(self.nodes.iter().cloned());
 
         // Simulation canvas: runs a physics step per frame when playing
-        let graph_handle = cx.entity();
+        let graph_handle = graph_entity.clone();
         let nodes_for_sim = self.nodes.clone();
         let edge_pairs = self.edge_pairs.clone();
         let sim_canvas = canvas(
@@ -81,14 +87,14 @@ impl Render for Graph {
                 let mut fy = vec![0.0f32; n];
 
                 // Force parameters (tune for stability/perf)
-                let repulsion = 1200.0f32; // lower repulsion reduces oscillation
+                let repulsion = 120.0f32; // lower repulsion reduces oscillation
                 let attraction = 0.03f32; // stronger springs for faster settling
                 let gravity = 0.006f32; // pull toward center
                 let damping = 0.85f32; // velocity damping
                 let dt = 0.5f32; // larger step, clamped below
                 let max_disp = 5.0f32; // cap displacement per step
-                let center_x = 600.0f32;
-                let center_y = 400.0f32;
+                let center_x = 800.0f32;
+                let center_y = 200.0f32;
 
                 // Spatial grid for approximate repulsion
                 use std::collections::HashMap;
@@ -206,8 +212,11 @@ impl Render for Graph {
             .border_color(rgb(0xcccccc))
             .on_mouse_down(
                 gpui::MouseButton::Left,
-                cx.listener(|this, _e: &gpui::MouseDownEvent, _w, _cx| {
-                    this.playing = !this.playing;
+                cx.listener({
+                    move |this, _e: &gpui::MouseDownEvent, _w, cx| {
+                        this.playing = !this.playing;
+                        cx.notify();
+                    }
                 }),
             );
 
@@ -259,8 +268,9 @@ impl Render for Graph {
                     // selection updates above trigger re-render
                 }),
             )
-            .on_scroll_wheel(
-                cx.listener(|this, event: &gpui::ScrollWheelEvent, _window, cx| {
+            .on_scroll_wheel(cx.listener({
+                let graph_id = graph_id;
+                move |this, event: &gpui::ScrollWheelEvent, _window, cx| {
                     let delta_px = event.delta.pixel_delta(px(16.0));
                     let dy = delta_px.y;
 
@@ -284,10 +294,11 @@ impl Render for Graph {
                                 node.pan = pan;
                             });
                         }
-                        // zoom/pan updates above trigger re-render
+                        // ensure the graph re-renders so shared canvases reflect new zoom/pan
+                        cx.notify();
                     }
-                }),
-            )
+                }
+            }))
             .child(graph_canvas)
             .child(play_button)
     }
@@ -377,7 +388,7 @@ struct DragPreview;
 impl Render for DragPreview {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         // Invisible 1x1 element as drag ghost
-        div().size(px(1.0)).bg(rgb(0xffffff)).opacity(1.0)
+        div().size(px(1.0)).bg(rgb(0xffffff)).opacity(0.0)
     }
 }
 
