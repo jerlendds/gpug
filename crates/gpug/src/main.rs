@@ -5,12 +5,13 @@ use gpui::{
 };
 
 impl Render for Graph {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, graph_cx: &mut Context<Self>) -> impl IntoElement {
         // Batched edges canvas: draw all edges in a single paint pass
         let edge_pairs = self.edge_pairs.clone();
         let nodes_for_edges = self.nodes.clone();
         let zoom = self.zoom;
         let pan = self.pan;
+        let graph_entity = graph_cx.entity();
         let edges_canvas = canvas(
             move |_bounds, _window, _cx| (),
             move |_bounds, _state, window, cx| {
@@ -20,14 +21,18 @@ impl Render for Graph {
                     if i >= nodes_for_edges.len() || j >= nodes_for_edges.len() {
                         continue;
                     }
-                    let (x1, y1) = cx.read_entity(&nodes_for_edges[i], |n, _| (n.x + px(8.0), n.y + px(8.0)));
-                    let (x2, y2) = cx.read_entity(&nodes_for_edges[j], |n, _| (n.x + px(8.0), n.y + px(8.0)));
+                    let (x1, y1) =
+                        cx.read_entity(&nodes_for_edges[i], |n, _| (n.x + px(8.0), n.y + px(8.0)));
+                    let (x2, y2) =
+                        cx.read_entity(&nodes_for_edges[j], |n, _| (n.x + px(8.0), n.y + px(8.0)));
 
                     let p1 = point(pan.x + x1 * zoom, pan.y + y1 * zoom);
                     let p2 = point(pan.x + x2 * zoom, pan.y + y2 * zoom);
                     let dir = point(p2.x - p1.x, p2.y - p1.y);
                     let len = dir.magnitude() as f32;
-                    if len <= 0.0001 { continue; }
+                    if len <= 0.0001 {
+                        continue;
+                    }
                     let half_thickness: f32 = thickness as f32;
                     let normal = point(-dir.y, dir.x) * (half_thickness / len);
 
@@ -53,12 +58,12 @@ impl Render for Graph {
             .children(self.nodes.iter().cloned());
 
         // Simulation canvas: runs a physics step per frame when playing
-        let graph_handle = cx.entity();
+        let graph_handle = graph_entity.clone();
         let nodes_for_sim = self.nodes.clone();
         let edge_pairs = self.edge_pairs.clone();
         let sim_canvas = canvas(
             move |_bounds, _window, _cx| (),
-            move |_bounds, _state, _window, cx| {
+            move |_bounds, _state, window, cx| {
                 let playing = cx.read_entity(&graph_handle, |g: &Graph, _| g.playing);
                 if !playing {
                     return;
@@ -67,6 +72,8 @@ impl Render for Graph {
                 if n == 0 {
                     return;
                 }
+
+                window.request_animation_frame();
 
                 // Read positions
                 let mut xs: Vec<f32> = Vec::with_capacity(n);
@@ -81,14 +88,14 @@ impl Render for Graph {
                 let mut fy = vec![0.0f32; n];
 
                 // Force parameters (tune for stability/perf)
-                let repulsion = 1200.0f32; // lower repulsion reduces oscillation
+                let repulsion = 120.0f32; // lower repulsion reduces oscillation
                 let attraction = 0.03f32; // stronger springs for faster settling
                 let gravity = 0.006f32; // pull toward center
                 let damping = 0.85f32; // velocity damping
                 let dt = 0.5f32; // larger step, clamped below
                 let max_disp = 5.0f32; // cap displacement per step
-                let center_x = 600.0f32;
-                let center_y = 400.0f32;
+                let center_x = 800.0f32;
+                let center_y = 200.0f32;
 
                 // Spatial grid for approximate repulsion
                 use std::collections::HashMap;
@@ -121,7 +128,7 @@ impl Render for Graph {
                                 }
                                 let dx = xs[j] - xs[i];
                                 let dy = ys[j] - ys[i];
-                                let mut d2 = dx * dx + dy * dy + 0.01;
+                                let d2 = dx * dx + dy * dy + 0.01;
                                 let inv = 1.0 / d2;
                                 let fx_ij = repulsion * dx * inv;
                                 let fy_ij = repulsion * dy * inv;
@@ -181,7 +188,7 @@ impl Render for Graph {
                         node.y = ny;
                     });
                 }
-                // Schedule next frame: nudge state and request another pass
+                // Bookkeep a tick so any observers can react and mark the graph dirty
                 cx.update_entity(&graph_handle, |g: &mut Graph, _| {
                     g.sim_tick = g.sim_tick.wrapping_add(1);
                 });
@@ -206,8 +213,11 @@ impl Render for Graph {
             .border_color(rgb(0xcccccc))
             .on_mouse_down(
                 gpui::MouseButton::Left,
-                cx.listener(|this, _e: &gpui::MouseDownEvent, _w, _cx| {
-                    this.playing = !this.playing;
+                graph_cx.listener({
+                    move |this, _e: &gpui::MouseDownEvent, _w, cx| {
+                        this.playing = !this.playing;
+                        cx.notify();
+                    }
                 }),
             );
 
@@ -218,7 +228,7 @@ impl Render for Graph {
             // Clicking selects node under cursor; shift adds to selection; clicking empty space clears
             .on_mouse_down(
                 gpui::MouseButton::Left,
-                cx.listener(|this, e: &gpui::MouseDownEvent, _w, cx| {
+                graph_cx.listener(|this, e: &gpui::MouseDownEvent, _w, cx| {
                     let cursor = e.position;
                     let mut hit_index: Option<usize> = None;
                     for (i, n) in this.nodes.iter().enumerate() {
@@ -259,8 +269,8 @@ impl Render for Graph {
                     // selection updates above trigger re-render
                 }),
             )
-            .on_scroll_wheel(
-                cx.listener(|this, event: &gpui::ScrollWheelEvent, _window, cx| {
+            .on_scroll_wheel(graph_cx.listener({
+                move |this, event: &gpui::ScrollWheelEvent, _window, cx| {
                     let delta_px = event.delta.pixel_delta(px(16.0));
                     let dy = delta_px.y;
 
@@ -284,10 +294,11 @@ impl Render for Graph {
                                 node.pan = pan;
                             });
                         }
-                        // zoom/pan updates above trigger re-render
+                        // ensure the graph re-renders so shared canvases reflect new zoom/pan
+                        cx.notify();
                     }
-                }),
-            )
+                }
+            }))
             .child(graph_canvas)
             .child(play_button)
     }
@@ -343,7 +354,7 @@ impl Render for GpugNode {
                     }
                 }),
             )
-            .on_drop(cx.listener(|this, dragged_id: &u64, _window, cx| {
+            .on_drop(cx.listener(|this, dragged_id: &u64, _window, _cx| {
                 if *dragged_id == this.id {
                     this.drag_offset = None;
                 }
@@ -377,7 +388,7 @@ struct DragPreview;
 impl Render for DragPreview {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         // Invisible 1x1 element as drag ghost
-        div().size(px(1.0)).bg(rgb(0xffffff)).opacity(1.0)
+        div().size(px(1.0)).bg(rgb(0xffffff)).opacity(0.0)
     }
 }
 
@@ -386,7 +397,7 @@ type GraphEdges = Vec<Entity<GpugEdge>>;
 // Root view that hosts nodes
 struct Graph {
     nodes: GraphNodes,
-    edges: GraphEdges,
+    // edges: GraphEdges,
     edge_pairs: Vec<(usize, usize)>,
     sim_tick: u64,
     zoom: f32,
@@ -398,10 +409,10 @@ impl Graph {
     fn new(cx: &mut App, total_nodes: usize, random_link_chance: f32) -> Self {
         // Create a random graph: N nodes, edges with probability p
         let nodes: Vec<Entity<GpugNode>> = generate_nodes(cx, total_nodes);
-        let (edges, edge_pairs) = randomly_link_nodes_with_pairs(cx, &nodes, random_link_chance);
+        let (_edges, edge_pairs) = randomly_link_nodes_with_pairs(cx, &nodes, random_link_chance);
         Self {
             nodes,
-            edges,
+            // edges,
             edge_pairs,
             sim_tick: 0,
             zoom: 1.0,
