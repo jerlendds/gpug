@@ -1,10 +1,12 @@
+![status](https://img.shields.io/badge/status-experimental-orange)
+
 <p dir="auto">
   <a href="https://github.com/jerlendds/gpug">
     <img src="./logo.png" height="220px" alt="GPUG logo" align="left" />
   </a>
 
   <h3 align="left">
-    GPUG: GPU Graphs with GPUI
+    GPUG: A GPU-accelerated graph visualization engine built with Zed’s GPUI, exploring how far Rust and the GPUI can take interactive graph rendering.
   </h3>
 
 
@@ -23,8 +25,7 @@
 
 # gpug
 
-
-As is, GPUG is a proof-of-concept network graph prototype that leverages the GPU for enhanced performance using Zed's gpui library. This approach allows for the visualization and manipulation of complex graphs, making it easier to understand and analyze data connections in real-time. We're currently in the process of turning GPUG into a Rust library.
+GPUG is a prototype for a high-performance, interactive network graph visualization library that leverages the GPU via Zed's gpui library. This approach allows for the visualization and manipulation of complex graphs, and serves as a foundation for a future Rust library focused on graph interactivity and visualization.
 
 [gpui-network-graph.mp4](https://github.com/user-attachments/assets/75b3a6d1-3cf1-42c2-9dc7-1f48b570e9bd)
 
@@ -42,16 +43,28 @@ Created with Create GPUI App, to get started with GPUI visit the GPUI documentat
 
 ## Usage
 
-- Ensure Rust is installed - [Rustup](https://rustup.rs/)
-- Run gpug with `cargo run`
-- Or run gpug with `cargo watch -q -c -w crates/gpug -x 'run -p gpug'`
-- To build gpug `cargo build --release`
+0. Ensure Rust is installed ~ [Rustup](https://rustup.rs/)
+
+1. To hack on gpug
+   ```bash
+   git clone https://github.com/jerlendds/gpug
+   cd gpug
+   cargo run
+   # or to watch:
+   cargo watch -q -c -w crates/gpug -x 'run -p gpug
+   ```
+
+2. To build gpug
+   ```bash
+   cargo build --release
+   ```
+
 
 ## Roadmap
 
 | Feature | Description | Completed |
 |----------|--------------|------------|
-| **Proof-of-concept** | Is it possible to render interactive network graphs easily and quickly with GPUI? | true |
+| **Proof-of-concept** | Is it possible to render interactive network graphs with GPUI? | true |
 | **Built-in Node & Edge Types** | GPUG ships with default node and edge types (e.g. `default`, `smoothstep`, `step`, `straight`) but supports full customization. | false |
 | **Custom Nodes & Edges** | You can define fully custom nodes (with arbitrary rendering, embedded elements) and edges with custom behavior and style. | false |
 | **Handles / Ports** | Connection handles (ports) can be placed on any side or position, styled arbitrarily, enabling multiple inputs/outputs per node. | false |
