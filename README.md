@@ -4,14 +4,14 @@
   </a>
 
   <h3 align="left">
-    <i>GPUG ~ GPU Graphs with GPUI</i>
+    GPUG: GPU Graphs with GPUI
   </h3>
 
 
   <p align="left">
-    
+
   *The origins of graph theory are humble, even frivolous.*
-  
+
   ~ [*Norman L. Biggs*](https://en.wikipedia.org/wiki/Norman_L._Biggs)
   </p>
   <br/>
