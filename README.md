@@ -21,4 +21,4 @@ Created with Create GPUI App.
 
 ## Demo
 
-[gpui-network-graph.mp4](https://github.com/user-attachments/assets/2ba09fec-b6c9-4363-9c01-fdf968aa26d4)
+[gpui-network-graph.mp4](https://github.com/user-attachments/assets/75b3a6d1-3cf1-42c2-9dc7-1f48b570e9bd)
