@@ -1,4 +1,16 @@
-# gpug
+<p>
+  <a href="https://github.com/jerlendds/gpug">
+    <img src="./logo.png" height="226px" alt="GPUG logo" />
+  </a>
+</p>
+
+> *The origins of graph theory are humble, even frivolous.*
+>
+> ~ **[Norman L. Biggs](https://en.wikipedia.org/wiki/Norman_L._Biggs)**
+
+---
+
+# gpug - work in progress
 
 Created with Create GPUI App.
 
