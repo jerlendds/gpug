@@ -4,21 +4,24 @@
   </a>
 
   <h3 align="left">
-    <i>GPU graphs with GPUI</i>
+    <i>GPUG ~ GPU Graphs with GPUI</i>
   </h3>
-  <br />
-  <br />
 
-> *The origins of graph theory are humble, even frivolous.*
-> ~ [*Norman L. Biggs*](https://en.wikipedia.org/wiki/Norman_L._Biggs)
-  <br />
-  <br />
+
+  <p align="left">
+    
+  *The origins of graph theory are humble, even frivolous.*
+  
+  ~ [*Norman L. Biggs*](https://en.wikipedia.org/wiki/Norman_L._Biggs)
+  </p>
+  <br/>
 </p>
 
 ---
 
-# gpug - work in progress
+---
 
+# gpug
 
 Created with Create GPUI App.
 
