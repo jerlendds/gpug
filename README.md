@@ -24,7 +24,7 @@
 
 # gpug
 
-GPUG is a prototype for a high-performance, interactive network graph visualization library that leverages the GPU via Zed's gpui library. This approach allows for the visualization and manipulation of complex graphs, and serves as a foundation for a future Rust library focused on graph interactivity and visualization.
+GPUG is an initial prototype exploration in building a high-performance, interactive network graph visualization library that leverages the GPU via Zed's gpui library. This approach might allow for the visualization and manipulation of complex graphs, and serves as a foundation for a future Rust library focused on graph interactivity and visualization.
 
 [gpui-network-graph.mp4](https://github.com/user-attachments/assets/75b3a6d1-3cf1-42c2-9dc7-1f48b570e9bd)
 
