@@ -39,6 +39,8 @@ Created with Create GPUI App, to get started with GPUI visit the GPUI documentat
 - [gpui component library](https://github.com/longbridge/gpui-component)
 - [gpui music player](https://github.com/143mailliw/hummingbird)
 - [gpui examples visualized](https://studium.dev/tech/playing-gpui-rust)
+
+
 - [gpug notes from jerlendds](https://studium.dev/tech/gpui-networks)
 
 
@@ -52,7 +54,8 @@ Created with Create GPUI App, to get started with GPUI visit the GPUI documentat
    cd gpug
    cargo run --example kitchen_sink
    # or to watch:
-
+   # cargo install cargo-watch
+   cargo watch -x "run --example kitchen_sink"
    ```
 
 2. To build gpug
@@ -66,14 +69,6 @@ Created with Create GPUI App, to get started with GPUI visit the GPUI documentat
 | Feature | Description | Completed |
 |----------|--------------|------------|
 | **Proof-of-concept** | Is it possible to render interactive network graphs with GPUI? | true |
+| **[`petgraph`](https://lib.rs/crates/petgraph) or [`graph`](https://lib.rs/crates/graph) backends + more?** | Choose a graph backend fit for your usecase | false |
 | **Large Graph Handling** | Capable of visualizing graphs with thousands of nodes/edges? | false |
-| **Built-in Node & Edge Types** | GPUG ships with default node and edge types (e.g. `default`, `smoothstep`, `step`, `straight`) but supports full customization. | false |
-| **Custom Nodes & Edges** | You can define fully custom nodes (with arbitrary rendering, embedded elements) and edges with custom behavior and style. | false |
-| **Handles** | Connection handles can be placed on any side or position, styled arbitrarily, enabling multiple inputs/outputs per node. | false |
-| **Interactive Connections** | Users can drag from one handle to another to create new edges. | false |
-| **Viewport Control & Animation** | GPUG supports controlling the viewport (position, zoom) programmatically, and animating or constraining transforms. | false |
-| **Minimap, Controls, Background** | Out-of-the-box UI components like a minimap, pan/zoom controls, and grid background are included. | false |
-| **Animating Node / Edge Properties** | You can animate transitions of color, size, or position of nodes/edges. | false |
-| **Hands-on Examples** | Learn by example with various applications showcased. | false |
-| **Comprehensive Documentation** | Access thorough documentation | false |
-| **Helpful Resources** | Refer to the GPUG book for in-depth guidance. | false |
+| to be continued | at a later date... | false |
