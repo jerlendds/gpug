@@ -31,14 +31,16 @@ GPUG is an initial prototype exploration in building a high-performance, interac
 Created with Create GPUI App, to get started with GPUI visit the GPUI documentation or examples provided:
 
 - [`gpui`](https://www.gpui.rs/)
-- [GPUI documentation](https://github.com/zed-industries/zed/tree/main/crates/gpui/docs)
-- [GPUI examples](https://github.com/zed-industries/zed/tree/main/crates/gpui/examples)
-- [GPUI book](https://matinaniss.github.io/gpui-book/introduction.html)
-- [GPUI HN threads](https://duckduckgo.com/?t=ffab&q=%22gpui%22%20site%3Anews.ycombinator.com&ia=web)
-- [GPUI tutorial](https://github.com/hedge-ops/gpui-tutorial)
-- [GPUI component library](https://github.com/longbridge/gpui-component)
-- [GPUI music player](https://github.com/143mailliw/hummingbird)
-- [GPUI notes from jerlendds](https://studium.dev/tech/playing-gpui-rust)
+- [gpui documentation](https://github.com/zed-industries/zed/tree/main/crates/gpui/docs)
+- [gpui examples](https://github.com/zed-industries/zed/tree/main/crates/gpui/examples)
+- [gpui book](https://matinaniss.github.io/gpui-book/introduction.html)
+- [gpui HN threads](https://duckduckgo.com/?t=ffab&q=%22gpui%22%20site%3Anews.ycombinator.com&ia=web)
+- [gpui tutorial](https://github.com/hedge-ops/gpui-tutorial)
+- [gpui component library](https://github.com/longbridge/gpui-component)
+- [gpui music player](https://github.com/143mailliw/hummingbird)
+- [gpui examples visualized](https://studium.dev/tech/playing-gpui-rust)
+- [gpug notes from jerlendds](https://studium.dev/tech/gpui-networks)
+
 
 ## Usage
 
@@ -49,6 +51,8 @@ Created with Create GPUI App, to get started with GPUI visit the GPUI documentat
    git clone https://github.com/jerlendds/gpug
    cd gpug
    cargo run --example kitchen_sink
+   # or to watch:
+
    ```
 
 2. To build gpug
