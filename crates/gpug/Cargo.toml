@@ -1,8 +1,19 @@
 [package]
 name = "gpug"
 version = "0.1.0"
+author = ["jerlendds <oss@osintbuddy.com>"]
 edition = "2021"
 publish = false
+repository = "https://github.com/jerlendds/gpug"
+readme = "README.md"
+keywords = ["gui", "gpui", "network", "graph"]
+categories = ["gui"]
+
+[lib]
+name = "gpug"
+path = "src/gpug.rs"
+doctest = false
+
 
 [[bin]]
 name = "gpug"
@@ -10,3 +21,11 @@ path = "src/main.rs"
 
 [dependencies]
 gpui.workspace = true
+
+[[example]]
+name = "kitchen_sink"
+path = "examples/kitchen_sink.rs"
+
+[[example]]
+name = "large_graph"
+path = "examples/large_graph.rs"
