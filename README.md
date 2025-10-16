@@ -48,9 +48,7 @@ Created with Create GPUI App, to get started with GPUI visit the GPUI documentat
    ```bash
    git clone https://github.com/jerlendds/gpug
    cd gpug
-   cargo run
-   # or to watch:
-   cargo watch -q -c -w crates/gpug -x 'run -p gpug
+   cargo run --example kitchen_sink
    ```
 
 2. To build gpug

@@ -1,2 +1,2 @@
 pub mod utils;
-pub mod wattsstrogatz;
+pub mod watts_strogatz;

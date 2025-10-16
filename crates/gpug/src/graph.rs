@@ -2,7 +2,7 @@ use gpui::*;
 use gpui::{canvas, div, Context, IntoElement, ParentElement, Render, Styled, Window};
 
 use crate::edge::GpugEdge;
-use crate::generators::wattsstrogatz::generate_watts_strogatz_graph;
+use crate::generators::watts_strogatz::generate_watts_strogatz_graph;
 use crate::node::GpugNode;
 
 pub struct Graph {

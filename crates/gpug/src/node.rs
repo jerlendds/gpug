@@ -1,8 +1,5 @@
+use gpui::div;
 use gpui::*;
-use gpui::{
-    canvas, div, Application, Context, IntoElement, ParentElement, Render, Styled, Window,
-    WindowOptions,
-};
 
 // Simple draggable node
 pub struct GpugNode {
@@ -67,7 +64,7 @@ impl Render for GpugNode {
                 .absolute()
                 .left(self.pan.x + self.x * self.zoom - px(10.0))
                 .top(self.pan.y + self.y * self.zoom - px(10.0))
-                .p(px(10.0))
+                .p(px(14.0))
                 .border(px(4.0))
                 .rounded_full()
                 .border_color(rgb(0x1E90FF))
