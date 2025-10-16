@@ -3,7 +3,10 @@ use gpui::{App, AppContext, Application, WindowOptions};
 
 fn main() {
     Application::new().run(|cx: &mut App| {
-        cx.open_window(WindowOptions::default(), |_, cx| {
+        let mut window_opts = WindowOptions::default();
+        window_opts.app_id = Some("GPUG Kitchen Sink".to_string());
+
+        cx.open_window(window_opts, |_, cx| {
             cx.new(|cx| {
                 let node_count = 250;
                 let initial_k = 3;
