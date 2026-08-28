@@ -1,2 +1,5 @@
 target
 graphpapers
+artifacts/
+# shhhhhh....
+crates/secret-project/

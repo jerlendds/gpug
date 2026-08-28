@@ -1,9 +1,22 @@
-use crate::edge::GpugEdge;
+use crate::edge::Edge;
+use crate::generators::utils::generate_nodes_with_seed;
 use crate::generators::utils::rand_f32;
+use crate::GraphData;
 
 use std::collections::HashSet;
 
-pub fn generate_watts_strogatz_graph(n: usize, k: usize, beta: f32) -> Vec<GpugEdge> {
+#[allow(clippy::needless_range_loop)]
+pub fn generate_watts_strogatz_graph(n: usize, k: usize, beta: f32) -> Vec<Edge> {
+    generate_watts_strogatz_graph_with_seed(n, k, beta, 0xBADC0FFE_E0DDF00D)
+}
+
+#[allow(clippy::needless_range_loop)]
+pub fn generate_watts_strogatz_graph_with_seed(
+    n: usize,
+    k: usize,
+    beta: f32,
+    mut seed: u64,
+) -> Vec<Edge> {
     if n < 2 {
         return Vec::new();
     }
@@ -16,7 +29,6 @@ pub fn generate_watts_strogatz_graph(n: usize, k: usize, beta: f32) -> Vec<GpugE
 
     let rewiring_prob = beta.clamp(0.0, 1.0);
 
-    let mut seed: u64 = 0xBADC0FFE_E0DDF00D;
     let mut adjacency: Vec<HashSet<usize>> = (0..n)
         .map(|_| HashSet::with_capacity(effective_k * 2))
         .collect();
@@ -79,9 +91,55 @@ pub fn generate_watts_strogatz_graph(n: usize, k: usize, beta: f32) -> Vec<GpugE
     for source in 0..n {
         for &target in &adjacency[source] {
             if source < target {
-                edges.push(GpugEdge::new(source, target));
+                edges.push(Edge::new(source, target));
             }
         }
     }
     edges
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct WattsStrogatz {
+    node_count: usize,
+    neighbors: usize,
+    rewiring_probability: f32,
+    seed: u64,
+}
+
+impl WattsStrogatz {
+    pub fn new(node_count: usize) -> Self {
+        Self {
+            node_count,
+            neighbors: 3,
+            rewiring_probability: 0.05,
+            seed: 42,
+        }
+    }
+
+    pub fn neighbors(mut self, neighbors: usize) -> Self {
+        self.neighbors = neighbors;
+        self
+    }
+
+    pub fn rewiring_probability(mut self, probability: f32) -> Self {
+        self.rewiring_probability = probability;
+        self
+    }
+
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
+        self
+    }
+
+    pub fn generate(self) -> GraphData {
+        GraphData::new(
+            generate_nodes_with_seed(self.node_count, self.seed ^ 0xCAFE_BABE),
+            generate_watts_strogatz_graph_with_seed(
+                self.node_count,
+                self.neighbors,
+                self.rewiring_probability,
+                self.seed,
+            ),
+        )
+    }
 }

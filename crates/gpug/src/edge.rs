@@ -1,11 +1,19 @@
-#[derive(Clone)]
-pub struct GpugEdge {
-    pub source: usize,
-    pub target: usize,
+use crate::node::NodeId;
+
+#[derive(Clone, Debug)]
+pub struct Edge {
+    pub source: NodeId,
+    pub target: NodeId,
 }
 
-impl GpugEdge {
-    pub fn new(source: usize, target: usize) -> Self {
-        Self { source, target }
+impl Edge {
+    pub fn new(source: impl Into<NodeId>, target: impl Into<NodeId>) -> Self {
+        Self {
+            source: source.into(),
+            target: target.into(),
+        }
     }
 }
+
+#[deprecated(note = "use Edge")]
+pub type GpugEdge = Edge;
