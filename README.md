@@ -72,25 +72,3 @@ Created with Create GPUI App, to get started with GPUI visit the GPUI documentat
 | **[`petgraph`](https://lib.rs/crates/petgraph) or [`graph`](https://lib.rs/crates/graph) backends + more?** | Choose a graph backend fit for your usecase | false |
 | **Large Graph Handling** | Capable of visualizing graphs with thousands of nodes/edges? | true |
 | to be continued | at a later date... | false |
-
-## Performance review loop
-
-Run a named baseline before editing, then run another named iteration after an
-optimization:
-
-```bash
-./scripts/review-optimize-loop.sh baseline
-./scripts/review-optimize-loop.sh reuse-layout-buffers
-```
-
-Each pass formats and reviews all targets, runs tests and Clippy, benchmarks the
-same deterministic force-layout workload, captures both the initial 10,000-node
-graph and a post-layout frame, and compares its benchmark and screenshots with
-the preceding pass. Results are kept
-under `artifacts/performance/<iteration>/`. Override workload size with
-`GPUG_NODE_COUNT`, `GPUG_EDGE_PROBABILITY`, and `GPUG_BENCH_FRAMES`. The default
-large workload is a small-world graph with three local neighbors per side and a
-`0.00001` probability of each random long-range shortcut (about 30,500 edges).
-
-See [PERFORMANCE.md](PERFORMANCE.md) for current results and architecture notes.
-The complete developer guide starts at [docs/README.md](docs/README.md).
