@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use gpui::{canvas, div, *};
 
@@ -12,8 +14,8 @@ use crate::editor::{EditorModel, EditorStore, GraphOwnership, SelectionMode};
 use crate::editor::{Handle, HandleKey, HandleKind, Position};
 use crate::input::{Gesture, GestureOwner, GestureRouter, PointerController};
 use crate::layout::{
-    apply_fit, step_with_budget, AnimatedBatchLayout, BatchLayout, ForceAtlas2, Layout, LayoutFit,
-    LayoutOptions, LayoutStatus,
+    AnimatedBatchLayout, BatchLayout, ForceAtlas2, Layout, LayoutFit, LayoutOptions, LayoutStatus,
+    apply_fit, step_with_budget,
 };
 use crate::node::{Node, NodeId};
 use crate::renderer::GraphRenderer;
@@ -25,6 +27,10 @@ struct SmoothZoom {
     target: f32,
     anchor: Point<Pixels>,
 }
+
+const CONNECTION_HANDLE_SIZE_WORLD: f32 = 0.7;
+const CONNECTION_HANDLE_GAP_WORLD: f32 = 0.5;
+const RECONNECT_HANDLE_SIZE_WORLD: f32 = 0.9;
 
 /// Edge type resolved once per membership change. Comparing a copyable tag per
 /// frame beats re-reading and re-hashing every edge's type string.
@@ -70,13 +76,24 @@ struct SceneCache {
     node_ids: Rc<[NodeId]>,
     node_sizes: Rc<[crate::WorldSize]>,
     edge_kinds: Rc<[EdgeKind]>,
+    edge_ids: Rc<[crate::EdgeId]>,
     edge_markers: Rc<[(bool, bool)]>,
     edge_appearances: Rc<[EdgeAppearance]>,
     positions: Rc<[WorldPoint]>,
     edge_geometries: Rc<[Option<Vec<WorldPoint>>]>,
     node_appearances: Rc<[NodeAppearance]>,
     selected: Rc<[usize]>,
-    selected_edges: Rc<[LayoutEdge]>,
+    selected_edges: Rc<[(crate::EdgeId, LayoutEdge)]>,
+}
+
+fn reconnecting_edge_id(state: &ConnectionState) -> Option<crate::EdgeId> {
+    match state {
+        ConnectionState::Connecting {
+            intent: ConnectionIntent::ReconnectSource(id) | ConnectionIntent::ReconnectTarget(id),
+            ..
+        } => Some(*id),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +142,101 @@ pub enum ContextMenuTarget {
     Pane,
 }
 
+#[derive(Default)]
+struct GraphDataApiState {
+    nodes: Vec<Node>,
+    edges: Vec<Edge>,
+    pending: HashMap<NodeId, HashMap<String, String>>,
+}
+
+/// Cloneable access to live graph connections and node metadata.
+///
+/// This is the Rust counterpart to React Flow's connection/data hooks and
+/// `updateNodeData`: node views may query upstream nodes and queue metadata
+/// patches without directly owning or mutating the graph entity.
+#[derive(Clone, Default)]
+pub struct GraphDataApi {
+    state: Arc<Mutex<GraphDataApiState>>,
+}
+
+impl GraphDataApi {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn node_connections(&self, node: NodeId, handle: HandleKind) -> Vec<Edge> {
+        let state = self.state.lock().expect("graph data API lock poisoned");
+        state
+            .edges
+            .iter()
+            .filter(|edge| match handle {
+                HandleKind::Source => edge.source == node,
+                HandleKind::Target => edge.target == node,
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn nodes_data(&self, ids: impl IntoIterator<Item = NodeId>) -> Vec<Node> {
+        let state = self.state.lock().expect("graph data API lock poisoned");
+        ids.into_iter()
+            .filter_map(|id| state.nodes.iter().find(|node| node.id == id).cloned())
+            .collect()
+    }
+
+    pub fn node_data(&self, id: NodeId) -> Option<Node> {
+        self.nodes_data([id]).into_iter().next()
+    }
+
+    pub fn update_node_data(
+        &self,
+        id: NodeId,
+        patch: impl IntoIterator<Item = (String, String)>,
+    ) -> bool {
+        let mut state = self.state.lock().expect("graph data API lock poisoned");
+        let patch = patch.into_iter().collect::<HashMap<_, _>>();
+        let Some(node) = state.nodes.iter_mut().find(|node| node.id == id) else {
+            return false;
+        };
+        if patch
+            .iter()
+            .all(|(key, value)| node.metadata.get(key) == Some(value))
+        {
+            return false;
+        }
+        node.metadata.extend(patch.clone());
+        state.pending.entry(id).or_default().extend(patch);
+        true
+    }
+
+    fn sync(&self, nodes: &[Node], edges: &[Edge]) {
+        let mut state = self.state.lock().expect("graph data API lock poisoned");
+        state.nodes.clear();
+        state.nodes.extend_from_slice(nodes);
+        state.edges.clear();
+        state.edges.extend_from_slice(edges);
+    }
+
+    fn take_pending(&self) -> HashMap<NodeId, HashMap<String, String>> {
+        std::mem::take(
+            &mut self
+                .state
+                .lock()
+                .expect("graph data API lock poisoned")
+                .pending,
+        )
+    }
+
+    fn has_pending(&self) -> bool {
+        !self
+            .state
+            .lock()
+            .expect("graph data API lock poisoned")
+            .pending
+            .is_empty()
+    }
+}
+
 pub struct GraphBuilder {
     data: GraphData,
     layout: Box<dyn Layout>,
@@ -142,6 +254,7 @@ pub struct GraphBuilder {
     auto_pan: bool,
     auto_pan_speed: f32,
     auto_pan_margin: f32,
+    data_api: GraphDataApi,
 }
 
 impl Default for GraphBuilder {
@@ -163,6 +276,7 @@ impl Default for GraphBuilder {
             auto_pan: true,
             auto_pan_speed: Graph::DEFAULT_AUTO_PAN_SPEED,
             auto_pan_margin: Graph::DEFAULT_AUTO_PAN_MARGIN,
+            data_api: GraphDataApi::default(),
         }
     }
 }
@@ -205,6 +319,11 @@ impl GraphBuilder {
 
     pub fn renderer(mut self, renderer: GraphRenderer) -> Self {
         self.renderer = renderer;
+        self
+    }
+
+    pub fn data_api(mut self, api: GraphDataApi) -> Self {
+        self.data_api = api;
         self
     }
 
@@ -315,6 +434,7 @@ pub struct Graph {
     pointer: Option<PointerController>,
     synced_membership_revision: u64,
     style_revision: u64,
+    data_api: GraphDataApi,
 }
 
 impl Graph {
@@ -353,6 +473,7 @@ impl Graph {
             .unwrap_or(0)
             .wrapping_add(1);
         let model = EditorModel::new(builder.data.nodes, builder.data.edges, builder.ownership)?;
+        builder.data_api.sync(&model.nodes, &model.edges);
         let synced_membership_revision = model.store.dirty.revisions.membership;
         Ok(Self {
             model,
@@ -390,6 +511,7 @@ impl Graph {
             pointer: None,
             synced_membership_revision,
             style_revision: 0,
+            data_api: builder.data_api,
         })
     }
 
@@ -751,8 +873,22 @@ impl Graph {
         let hit_radius = px(self.renderer.style().hit_radius_pixels);
         self.model.nodes.iter().position(|node| {
             let center = self.viewport.world_to_screen(self.node_center(node));
-            (center.x - position.x).abs() <= hit_radius
-                && (center.y - position.y).abs() <= hit_radius
+            let (half_width, half_height) = if self.renderer.has_node_content(node) {
+                let measured = self
+                    .model
+                    .store
+                    .runtimes
+                    .get(&node.id)
+                    .map_or(node.size, |runtime| runtime.measured);
+                (
+                    px(measured.width * self.viewport.zoom() * 0.5),
+                    px(measured.height * self.viewport.zoom() * 0.5),
+                )
+            } else {
+                (hit_radius, hit_radius)
+            };
+            (center.x - position.x).abs() <= half_width
+                && (center.y - position.y).abs() <= half_height
         })
     }
 
@@ -761,7 +897,7 @@ impl Graph {
         position: Point<Pixels>,
         end: bool,
     ) -> Option<(HandleKey, WorldPoint)> {
-        let hit = px(7.0);
+        let hit = px(CONNECTION_HANDLE_SIZE_WORLD * self.viewport.zoom());
         self.model
             .nodes
             .iter()
@@ -784,6 +920,7 @@ impl Graph {
                         .node_appearance(node, self.viewport.zoom())
                         .radius_pixels,
                     kind,
+                    self.viewport.zoom(),
                 );
                 let dx = (handle_position.x - position.x).abs();
                 let dy = (handle_position.y - position.y).abs();
@@ -817,7 +954,7 @@ impl Graph {
         &self,
         position: Point<Pixels>,
     ) -> Option<(HandleKey, ConnectionIntent)> {
-        let hit = px(8.0);
+        let hit = px(RECONNECT_HANDLE_SIZE_WORLD * self.viewport.zoom());
         self.model
             .edges
             .iter()
@@ -1088,6 +1225,7 @@ impl Graph {
                 .iter()
                 .map(|edge| EdgeKind::from_type(&edge.edge_type))
                 .collect();
+            self.scene.edge_ids = self.model.edges.iter().map(|edge| edge.id).collect();
             self.scene.edge_markers = self
                 .model
                 .edges
@@ -1224,7 +1362,10 @@ impl Graph {
                 .iter()
                 .zip(self.layout_edges.iter())
                 .filter_map(|(edge, layout)| {
-                    self.model.store.edge_selected(edge).then_some(*layout)
+                    self.model
+                        .store
+                        .edge_selected(edge)
+                        .then_some((edge.id, *layout))
                 })
                 .collect();
         }
@@ -1335,8 +1476,9 @@ fn connection_handle_position(
     center: Point<Pixels>,
     radius_pixels: f32,
     kind: HandleKind,
+    zoom: f32,
 ) -> Point<Pixels> {
-    let offset = px(radius_pixels + 5.0);
+    let offset = px(radius_pixels + CONNECTION_HANDLE_GAP_WORLD * zoom);
     point(
         if kind == HandleKind::Target {
             center.x - offset
@@ -1372,6 +1514,22 @@ fn world_bounds(nodes: &[Node], store: &EditorStore) -> Option<WorldBounds> {
 
 impl Render for Graph {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let data_updates = self.data_api.take_pending();
+        if !data_updates.is_empty() {
+            let changes = data_updates
+                .into_iter()
+                .filter_map(|(id, patch)| {
+                    let mut node = self.model.node(id)?.clone();
+                    node.metadata.extend(patch);
+                    Some(NodeChange::Replace { id, item: node })
+                })
+                .collect::<Vec<_>>();
+            self.model
+                .emit_nodes(changes)
+                .expect("graph data API produced valid metadata-only node updates");
+            self.flush();
+        }
+        self.data_api.sync(&self.model.nodes, &self.model.edges);
         self.sync();
         if self.fit_on_load_pending {
             self.fit_to_view(window.viewport_size(), px(40.0));
@@ -1406,6 +1564,7 @@ impl Render for Graph {
         let node_sizes = self.scene.node_sizes.clone();
         let node_appearances = self.scene.node_appearances.clone();
         let edge_kinds = self.scene.edge_kinds.clone();
+        let edge_ids = self.scene.edge_ids.clone();
         let edge_appearances = self.scene.edge_appearances.clone();
         let edge_markers = self.scene.edge_markers.clone();
         let edge_geometries = self.scene.edge_geometries.clone();
@@ -1415,6 +1574,7 @@ impl Render for Graph {
         let selected_edges = self.scene.selected_edges.clone();
         let edges = self.layout_edges.clone();
         let edge_stride = renderer.interactive_edge_stride(edges.len(), self.playing);
+        let reconnecting_edge = reconnecting_edge_id(&self.connection.state);
         let default_node = NodeAppearance {
             color: style.node_color,
             radius_pixels: renderer.node_radius_pixels(viewport.zoom()),
@@ -1439,6 +1599,7 @@ impl Render for Graph {
                         .node_appearance(node, self.viewport.zoom())
                         .radius_pixels,
                     from.kind,
+                    self.viewport.zoom(),
                 ));
                 (
                     WorldPoint::new(origin.x, self.node_center(node).y),
@@ -1449,12 +1610,47 @@ impl Render for Graph {
             _ => None,
         };
 
+        let node_contents = self
+            .model
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                if hidden[index]
+                    || visible_nodes
+                        .as_ref()
+                        .is_some_and(|visible| !visible.contains(&node.id))
+                {
+                    return None;
+                }
+                let content = renderer.node_content(node, viewport.zoom())?;
+                let center = viewport.world_to_screen(positions[index]);
+                let width = px((node_sizes[index].width * viewport.zoom()).max(1.0));
+                let height = px((node_sizes[index].height * viewport.zoom()).max(1.0));
+                Some(
+                    div()
+                        .absolute()
+                        .left(center.x - width * 0.5)
+                        .top(center.y - height * 0.5)
+                        .w(width)
+                        .h(height)
+                        .child(content),
+                )
+            })
+            .collect::<Vec<_>>();
+        if self.data_api.has_pending() {
+            cx.notify();
+        }
+
         let graph_canvas = canvas(
             |_bounds, _window, _cx| (),
             move |bounds, _, window, _cx| {
                 let st = (point(0., 1.), point(0., 1.), point(0., 1.));
                 let mut edge_path = Path::new(point(px(0.0), px(0.0)));
                 for (edge_index, edge) in edges.iter().enumerate().step_by(edge_stride) {
+                    if reconnecting_edge == Some(edge_ids[edge_index]) {
+                        continue;
+                    }
                     if hidden[edge.source] || hidden[edge.target] {
                         continue;
                     }
@@ -1495,6 +1691,9 @@ impl Render for Graph {
                 window.paint_path(edge_path, rgba((style.edge_color << 8) | 0x30));
 
                 for (edge_index, edge) in edges.iter().enumerate().step_by(edge_stride) {
+                    if reconnecting_edge == Some(edge_ids[edge_index]) {
+                        continue;
+                    }
                     if hidden[edge.source] || hidden[edge.target] {
                         continue;
                     }
@@ -1553,7 +1752,10 @@ impl Render for Graph {
 
                 if !selected_edges.is_empty() {
                     let mut path = Path::new(point(px(0.0), px(0.0)));
-                    for edge in selected_edges.iter() {
+                    for (edge_id, edge) in selected_edges.iter() {
+                        if reconnecting_edge == Some(*edge_id) {
+                            continue;
+                        }
                         if hidden[edge.source] || hidden[edge.target] {
                             continue;
                         }
@@ -1563,37 +1765,58 @@ impl Render for Graph {
                         }) {
                             continue;
                         }
-                        let p1 = viewport.world_to_screen(positions[edge.source]);
-                        let p2 = viewport.world_to_screen(positions[edge.target]);
-                        let direction = point(p2.x - p1.x, p2.y - p1.y);
-                        let length = direction.magnitude() as f32;
-                        if length <= 0.0001 {
+                        let Some(edge_index) = edge_ids.iter().position(|id| id == edge_id) else {
+                            continue;
+                        };
+                        let straight;
+                        let world_points = match &edge_geometries[edge_index] {
+                            Some(points) => points.as_slice(),
+                            None => {
+                                straight = [positions[edge.source], positions[edge.target]];
+                                &straight[..]
+                            }
+                        };
+                        if world_points.len() < 2 {
                             continue;
                         }
-                        let normal = point(-direction.y, direction.x) * (2.0 / length);
-                        path.push_triangle(
-                            (
-                                point(p1.x + normal.x, p1.y + normal.y),
-                                point(p1.x - normal.x, p1.y - normal.y),
-                                point(p2.x + normal.x, p2.y + normal.y),
-                            ),
-                            st,
-                        );
-                        path.push_triangle(
-                            (
-                                point(p2.x + normal.x, p2.y + normal.y),
-                                point(p1.x - normal.x, p1.y - normal.y),
-                                point(p2.x - normal.x, p2.y - normal.y),
-                            ),
-                            st,
-                        );
-                        for endpoint in [p1, p2] {
+                        for pair in world_points.windows(2) {
+                            let p1 = viewport.world_to_screen(pair[0]);
+                            let p2 = viewport.world_to_screen(pair[1]);
+                            let direction = point(p2.x - p1.x, p2.y - p1.y);
+                            let length = direction.magnitude() as f32;
+                            if length <= 0.0001 {
+                                continue;
+                            }
+                            let normal = point(-direction.y, direction.x) * (2.0 / length);
+                            path.push_triangle(
+                                (
+                                    point(p1.x + normal.x, p1.y + normal.y),
+                                    point(p1.x - normal.x, p1.y - normal.y),
+                                    point(p2.x + normal.x, p2.y + normal.y),
+                                ),
+                                st,
+                            );
+                            path.push_triangle(
+                                (
+                                    point(p2.x + normal.x, p2.y + normal.y),
+                                    point(p1.x - normal.x, p1.y - normal.y),
+                                    point(p2.x - normal.x, p2.y - normal.y),
+                                ),
+                                st,
+                            );
+                        }
+                        let endpoint_size = px(RECONNECT_HANDLE_SIZE_WORLD * viewport.zoom());
+                        let endpoints = [
+                            viewport.world_to_screen(world_points[0]),
+                            viewport.world_to_screen(world_points[world_points.len() - 1]),
+                        ];
+                        for endpoint in endpoints {
                             window.paint_quad(fill(
-                                Bounds::centered_at(endpoint, size(px(9.0), px(9.0))),
+                                Bounds::centered_at(endpoint, size(endpoint_size, endpoint_size)),
                                 rgb(0xffffff),
                             ));
                             window.paint_quad(outline(
-                                Bounds::centered_at(endpoint, size(px(9.0), px(9.0))),
+                                Bounds::centered_at(endpoint, size(endpoint_size, endpoint_size)),
                                 rgb(style.selection_color),
                                 BorderStyle::default(),
                             ));
@@ -1604,6 +1827,9 @@ impl Render for Graph {
 
                 let mut marker_path = Path::new(point(px(0.0), px(0.0)));
                 for (index, edge) in edges.iter().enumerate() {
+                    if reconnecting_edge == Some(edge_ids[index]) {
+                        continue;
+                    }
                     if hidden[edge.source] || hidden[edge.target] {
                         continue;
                     }
@@ -1737,6 +1963,7 @@ impl Render for Graph {
                     let r = px(appearance.radius_pixels);
                     let mut path = Path::new(center);
                     match appearance.shape {
+                        NodeShape::None => {}
                         NodeShape::Square => {
                             let a = point(center.x - r, center.y - r);
                             let b = point(center.x + r, center.y - r);
@@ -1758,6 +1985,7 @@ impl Render for Graph {
                 }
 
                 if show_handles {
+                    let handle_size = px(CONNECTION_HANDLE_SIZE_WORLD * viewport.zoom());
                     for (index, position) in positions.iter().enumerate() {
                         if hidden[index] {
                             continue;
@@ -1774,13 +2002,14 @@ impl Render for Graph {
                                 center,
                                 node_appearances[index].radius_pixels,
                                 kind,
+                                viewport.zoom(),
                             );
                             window.paint_quad(fill(
-                                Bounds::centered_at(handle, size(px(7.0), px(7.0))),
+                                Bounds::centered_at(handle, size(handle_size, handle_size)),
                                 rgb(0xffffff),
                             ));
                             window.paint_quad(outline(
-                                Bounds::centered_at(handle, size(px(7.0), px(7.0))),
+                                Bounds::centered_at(handle, size(handle_size, handle_size)),
                                 rgb(0x1e90ff),
                                 BorderStyle::default(),
                             ));
@@ -1805,18 +2034,20 @@ impl Render for Graph {
                         BorderStyle::default(),
                     ));
                     if !show_handles {
+                        let handle_size = px(CONNECTION_HANDLE_SIZE_WORLD * viewport.zoom());
                         for kind in [HandleKind::Target, HandleKind::Source] {
                             let handle = connection_handle_position(
                                 center,
                                 node_appearances[index].radius_pixels,
                                 kind,
+                                viewport.zoom(),
                             );
                             window.paint_quad(fill(
-                                Bounds::centered_at(handle, size(px(7.0), px(7.0))),
+                                Bounds::centered_at(handle, size(handle_size, handle_size)),
                                 rgb(0xffffff),
                             ));
                             window.paint_quad(outline(
-                                Bounds::centered_at(handle, size(px(7.0), px(7.0))),
+                                Bounds::centered_at(handle, size(handle_size, handle_size)),
                                 rgb(0x1e90ff),
                                 BorderStyle::default(),
                             ));
@@ -1948,6 +2179,7 @@ impl Render for Graph {
             .model
             .edges
             .iter()
+            .filter(|edge| reconnecting_edge != Some(edge.id))
             .filter_map(|edge| {
                 let label = edge.label.as_ref()?;
                 let source = self
@@ -2344,8 +2576,73 @@ impl Render for Graph {
                 }
             }))
             .child(graph_canvas)
+            .children(node_contents)
             .children(edge_labels)
             .child(controls)
             .child(play_button)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GraphDataApi, reconnecting_edge_id};
+    use crate::{
+        ConnectionIntent, ConnectionState, Edge, EdgeId, HandleKey, HandleKind, Node, NodeId,
+        WorldPoint,
+    };
+
+    #[test]
+    fn only_an_edge_being_reconnected_is_hidden_from_painting() {
+        let from = HandleKey {
+            node: NodeId(1),
+            id: None,
+            kind: HandleKind::Source,
+        };
+        let reconnecting = ConnectionState::Connecting {
+            from: from.clone(),
+            to: None,
+            pointer: WorldPoint::ZERO,
+            valid: None,
+            intent: ConnectionIntent::ReconnectTarget(EdgeId(7)),
+        };
+        let creating = ConnectionState::Connecting {
+            from,
+            to: None,
+            pointer: WorldPoint::ZERO,
+            valid: None,
+            intent: ConnectionIntent::Create,
+        };
+
+        assert_eq!(reconnecting_edge_id(&reconnecting), Some(EdgeId(7)));
+        assert_eq!(reconnecting_edge_id(&creating), None);
+        assert_eq!(reconnecting_edge_id(&ConnectionState::Idle), None);
+    }
+
+    #[test]
+    fn data_api_reads_live_connections_and_merges_node_data() {
+        let mut source = Node::new(1_u64, WorldPoint::ZERO);
+        source.metadata.insert("text".into(), "hello".into());
+        let target = Node::new(2_u64, WorldPoint::ZERO);
+        let edge = Edge::new(source.id, target.id).with_id(7_u64);
+        let api = GraphDataApi::new();
+        api.sync(&[source, target], &[edge]);
+
+        let connections = api.node_connections(NodeId(2), HandleKind::Target);
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].source, NodeId(1));
+        assert_eq!(
+            api.nodes_data(connections.into_iter().map(|edge| edge.source))[0]
+                .metadata
+                .get("text")
+                .map(String::as_str),
+            Some("hello")
+        );
+
+        assert!(api.update_node_data(NodeId(1), [("text".into(), "updated".into())]));
+        assert_eq!(
+            api.node_data(NodeId(1)).unwrap().metadata["text"],
+            "updated"
+        );
+        assert_eq!(api.take_pending().len(), 1);
     }
 }

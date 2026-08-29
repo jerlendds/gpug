@@ -1,7 +1,7 @@
-use crate::GraphData;
 use crate::edge::Edge;
 use crate::generators::utils::generate_nodes_with_seed;
 use crate::generators::utils::rand_f32;
+use crate::GraphData;
 
 use std::collections::HashSet;
 

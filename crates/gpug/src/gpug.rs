@@ -6,7 +6,7 @@ pub use crate::generators::utils::{generate_nodes, generate_nodes_with_seed};
 pub use crate::generators::watts_strogatz::{
     generate_watts_strogatz_graph, generate_watts_strogatz_graph_with_seed, WattsStrogatz,
 };
-pub use crate::graph::{ContextMenuTarget, Graph, GraphBuilder, GraphEvent};
+pub use crate::graph::{ContextMenuTarget, Graph, GraphBuilder, GraphDataApi, GraphEvent};
 pub use crate::layout::{
     AnimatedBatchLayout, BatchLayout, BatchLayoutAdapter, ForceAtlas2, Layout, LayoutFit,
     LayoutOptions, LayoutStatus,
@@ -14,7 +14,7 @@ pub use crate::layout::{
 pub use crate::node::{Node, NodeId};
 pub use crate::renderer::{
     EdgeAppearance, EdgePaintContext, EdgeTypeRenderer, EditorAction, GraphRenderer,
-    NodeAppearance, NodeRenderContext, NodeShape, NodeTypeRenderer,
+    NodeAppearance, NodeContentRenderer, NodeRenderContext, NodeShape, NodeTypeRenderer,
 };
 pub use crate::style::GraphStyle;
 pub mod connection;

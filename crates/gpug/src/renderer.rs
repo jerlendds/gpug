@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use gpui::AnyElement;
+
 use crate::{
     Diagnostic, Edge, EdgeId, GraphStyle, Node, NodeId, NodeRuntime, SharedDiagnosticSink,
     WorldPoint, WorldSize,
@@ -38,6 +40,8 @@ impl EdgePaintContext<'_> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NodeShape {
+    /// No canvas primitive. Used when registered node content paints the shell.
+    None,
     Square,
     Diamond,
 }
@@ -83,9 +87,23 @@ where
 pub struct GraphRenderer {
     style: GraphStyle,
     node_types: Arc<HashMap<String, Arc<dyn NodeTypeRenderer>>>,
+    node_contents: Arc<HashMap<String, Arc<dyn NodeContentRenderer>>>,
     edge_types: Arc<HashMap<String, Arc<dyn EdgeTypeRenderer>>>,
     diagnostics: Option<SharedDiagnosticSink>,
     reported: Arc<Mutex<HashSet<String>>>,
+}
+
+pub trait NodeContentRenderer: Send + Sync {
+    fn render(&self, node: &Node, zoom: f32) -> AnyElement;
+}
+
+impl<F> NodeContentRenderer for F
+where
+    F: Fn(&Node, f32) -> AnyElement + Send + Sync,
+{
+    fn render(&self, node: &Node, zoom: f32) -> AnyElement {
+        self(node, zoom)
+    }
 }
 
 impl fmt::Debug for GraphRenderer {
@@ -133,6 +151,28 @@ impl GraphRenderer {
         renderer: impl NodeTypeRenderer + 'static,
     ) {
         Arc::make_mut(&mut self.node_types).insert(name.into(), Arc::new(renderer));
+    }
+    /// Registers interactive content rendered inside the graph-owned shell for
+    /// a node type. Positioning, visibility, selection, and dragging remain
+    /// owned by `Graph`; the returned element owns only the node's contents.
+    pub fn register_node_content(
+        &mut self,
+        name: impl Into<String>,
+        renderer: impl NodeContentRenderer + 'static,
+    ) {
+        Arc::make_mut(&mut self.node_contents).insert(name.into(), Arc::new(renderer));
+    }
+
+    pub fn node_content(&self, node: &Node, zoom: f32) -> Option<AnyElement> {
+        self.node_contents
+            .get(&node.node_type)
+            .or_else(|| self.node_contents.get("default"))
+            .map(|renderer| renderer.render(node, zoom))
+    }
+
+    pub fn has_node_content(&self, node: &Node) -> bool {
+        self.node_contents.contains_key(&node.node_type)
+            || self.node_contents.contains_key("default")
     }
     pub fn register_edge_type(
         &mut self,

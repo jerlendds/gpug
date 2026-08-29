@@ -1,7 +1,7 @@
-use crate::GraphData;
 use crate::edge::Edge;
 use crate::generators::utils::generate_nodes_with_seed;
 use crate::generators::utils::rand_f64;
+use crate::GraphData;
 
 /// Generates a deterministic undirected G(n, p) graph in expected O(n + m).
 pub fn generate_erdos_renyi_graph(n: usize, probability: f64) -> Vec<Edge> {
