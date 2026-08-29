@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -100,6 +100,12 @@ fn reconnecting_edge_id(state: &ConnectionState) -> Option<crate::EdgeId> {
 pub enum GraphEvent {
     NodesChanged(Vec<NodeChange>),
     EdgesChanged(Vec<EdgeChange>),
+    /// Nodes removed by one delete action, together with the edges that were
+    /// attached to them immediately before the action was applied.
+    NodesDeleted {
+        deleted: Vec<Node>,
+        connected_edges: Vec<Edge>,
+    },
     Connected(Edge),
     Reconnected {
         id: crate::EdgeId,
@@ -702,7 +708,33 @@ impl Graph {
 
     /// Deletes the selected, deletable graph elements.
     pub fn delete_selected(&mut self) -> bool {
-        self.model.delete_selected(|_, _| true)
+        self.delete_selected_and_emit()
+    }
+
+    fn delete_selected_and_emit(&mut self) -> bool {
+        let deleted = self
+            .model
+            .nodes
+            .iter()
+            .filter(|node| self.model.store.node_selected(node) && node.deletable)
+            .cloned()
+            .collect::<Vec<_>>();
+        let deleted_ids = deleted.iter().map(|node| node.id).collect::<HashSet<_>>();
+        let connected_edges = self
+            .model
+            .edges
+            .iter()
+            .filter(|edge| deleted_ids.contains(&edge.source) || deleted_ids.contains(&edge.target))
+            .cloned()
+            .collect::<Vec<_>>();
+        let changed = self.model.delete_selected(|_, _| true);
+        if changed && !deleted.is_empty() {
+            self.events.push(GraphEvent::NodesDeleted {
+                deleted,
+                connected_edges,
+            });
+        }
+        changed
     }
 
     pub fn take_events(&mut self) -> Vec<GraphEvent> {
@@ -785,7 +817,7 @@ impl Graph {
                 true
             }
             "backspace" | "delete" => {
-                self.model.delete_selected(|_, _| true);
+                self.delete_selected_and_emit();
                 self.announce("Deleted selected graph elements");
                 true
             }
@@ -890,6 +922,20 @@ impl Graph {
             (center.x - position.x).abs() <= half_width
                 && (center.y - position.y).abs() <= half_height
         })
+    }
+
+    fn node_allows_drag_at_screen_position(&self, node: &Node, position: Point<Pixels>) -> bool {
+        if !node.draggable {
+            return false;
+        }
+        let pointer = self.screen_to_world(position);
+        let absolute = self.model.store.node_position_absolute(node);
+        let top_left = WorldPoint::new(
+            absolute.x - node.size.width * node.origin.x,
+            absolute.y - node.size.height * node.origin.y,
+        );
+        let local = WorldPoint::new(pointer.x - top_left.x, pointer.y - top_left.y);
+        node.allows_drag_at(local)
     }
 
     fn handle_at_screen_position(
@@ -1040,19 +1086,21 @@ impl Graph {
     fn edge_index_at_screen_position(&self, position: Point<Pixels>) -> Option<usize> {
         let point_x = position.x / px(1.0);
         let point_y = position.y / px(1.0);
-        self.layout_edges
+        // Hit testing can run between a structural edit and the next render,
+        // before `sync` has rebuilt `layout_edges`. Use the live edge list and
+        // stable endpoint IDs so deleting an edge cannot leave parallel arrays
+        // with mismatched lengths or ordering here.
+        self.model
+            .edges
             .iter()
             .enumerate()
-            .position(|(edge_index, edge)| {
-                let tolerance =
-                    self.model.edges[edge_index].interaction_width_for_hit_testing() * 0.5;
+            .find_map(|(edge_index, edge)| {
+                let source = self.model.node(edge.source)?;
+                let target = self.model.node(edge.target)?;
+                let tolerance = edge.interaction_width_for_hit_testing() * 0.5;
                 let tolerance_squared = tolerance.powi(2);
-                let start = self
-                    .viewport
-                    .world_to_screen(self.node_center(&self.model.nodes[edge.source]));
-                let end = self
-                    .viewport
-                    .world_to_screen(self.node_center(&self.model.nodes[edge.target]));
+                let start = self.viewport.world_to_screen(self.node_center(source));
+                let end = self.viewport.world_to_screen(self.node_center(target));
                 let start_x = start.x / px(1.0);
                 let start_y = start.y / px(1.0);
                 let dx = end.x / px(1.0) - start_x;
@@ -1066,7 +1114,8 @@ impl Graph {
                 };
                 let nearest_x = start_x + t * dx;
                 let nearest_y = start_y + t * dy;
-                (point_x - nearest_x).powi(2) + (point_y - nearest_y).powi(2) <= tolerance_squared
+                ((point_x - nearest_x).powi(2) + (point_y - nearest_y).powi(2) <= tolerance_squared)
+                    .then_some(edge_index)
             })
     }
 
@@ -2277,6 +2326,14 @@ impl Render for Graph {
                             .model
                             .select_node(id, event.modifiers.shift, event.modifiers.shift);
                         if !graph.model.store.node_selected(&graph.model.nodes[index]) {
+                            graph.flush();
+                            cx.notify();
+                            return;
+                        }
+                        if !graph.node_allows_drag_at_screen_position(
+                            &graph.model.nodes[index],
+                            event.position,
+                        ) {
                             graph.flush();
                             cx.notify();
                             return;

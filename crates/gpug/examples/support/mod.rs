@@ -43,6 +43,7 @@ pub struct CatalogExample {
     pub node_count: usize,
     pub show_handles: bool,
     pub on_event: Option<ExampleEventHandler>,
+    pub initial_data: Option<fn() -> GraphData>,
 }
 
 impl CatalogExample {
@@ -55,6 +56,7 @@ impl CatalogExample {
             node_count: 5,
             show_handles: false,
             on_event: None,
+            initial_data: None,
         }
     }
 
@@ -78,6 +80,10 @@ impl CatalogExample {
         self.on_event = Some(handler);
         self
     }
+    pub const fn initial_data(mut self, data: fn() -> GraphData) -> Self {
+        self.initial_data = Some(data);
+        self
+    }
 }
 
 pub fn run_catalog_example(example: CatalogExample) {
@@ -88,6 +94,14 @@ pub fn run_catalog_example(example: CatalogExample) {
         };
         cx.open_window(options, move |_, cx| {
             let graph = cx.new(|cx| {
+                if let Some(initial_data) = example.initial_data {
+                    return Graph::builder()
+                        .data(initial_data())
+                        .fit_on_load()
+                        .show_handles(example.show_handles)
+                        .build(cx)
+                        .unwrap();
+                }
                 let count = example.node_count.max(2);
                 let mut nodes = Vec::with_capacity(count);
                 for index in 0..count {
