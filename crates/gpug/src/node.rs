@@ -57,6 +57,18 @@ pub struct Node {
     /// precedence over `custom_handle`, which permits interactive children
     /// inside a larger drag handle.
     pub nodrag: Vec<WorldBounds>,
+    /// Directions in which resize gestures are accepted. `None` enables all
+    /// eight directions when graph resize handles are enabled.
+    pub resize_directions: Option<Vec<crate::ResizeDirection>>,
+    /// Whether the graph paints its standard resize handles for this node.
+    /// Hit testing remains active so custom node content can provide the UI.
+    pub show_resize_controls: bool,
+    /// Half-size of each resize control's square hit region in screen pixels.
+    pub resize_control_hit_radius: f32,
+    /// Keeps resize controls interactive and visible without node selection.
+    pub resize_controls_always_visible: bool,
+    /// Optional color override for this node's resize controls.
+    pub resize_control_color: Option<u32>,
 }
 
 impl Node {
@@ -81,6 +93,11 @@ impl Node {
             hidden: false,
             custom_handle: None,
             nodrag: Vec::new(),
+            resize_directions: None,
+            show_resize_controls: true,
+            resize_control_hit_radius: 8.0,
+            resize_controls_always_visible: false,
+            resize_control_color: None,
         }
     }
 
@@ -122,6 +139,42 @@ impl Node {
     /// override both whole-node dragging and a custom drag handle.
     pub fn with_nodrag(mut self, bounds: WorldBounds) -> Self {
         self.nodrag.push(bounds);
+        self
+    }
+
+    /// Restricts resize gestures to the supplied directions.
+    pub fn with_resize_directions(
+        mut self,
+        directions: impl IntoIterator<Item = crate::ResizeDirection>,
+    ) -> Self {
+        self.resize_directions = Some(directions.into_iter().collect());
+        self
+    }
+
+    /// Hides standard resize handles while retaining their hit regions for a
+    /// custom resize control rendered as part of the node.
+    pub fn with_custom_resize_controls(mut self) -> Self {
+        self.show_resize_controls = false;
+        self
+    }
+
+    /// Sets the screen-space hit radius for custom resize controls.
+    pub fn with_resize_control_hit_radius(mut self, radius_pixels: f32) -> Self {
+        if radius_pixels.is_finite() && radius_pixels >= 0.0 {
+            self.resize_control_hit_radius = radius_pixels;
+        }
+        self
+    }
+
+    /// Keeps this node's resize controls visible and interactive at all times.
+    pub fn with_always_visible_resize_controls(mut self) -> Self {
+        self.resize_controls_always_visible = true;
+        self
+    }
+
+    /// Overrides the graph selection color for this node's resize controls.
+    pub fn with_resize_control_color(mut self, color: u32) -> Self {
+        self.resize_control_color = Some(color);
         self
     }
 

@@ -433,7 +433,7 @@ pub struct Graph {
     next_edge_id: u64,
     events: Vec<GraphEvent>,
     announcement: String,
-    resize_node: Option<(usize, WorldPoint, WorldBounds)>,
+    resize_node: Option<(usize, crate::NodeResizeControl)>,
     only_render_visible_elements: bool,
     selection_mode: SelectionMode,
     snap_grid: Option<crate::WorldSize>,
@@ -611,6 +611,51 @@ impl Graph {
     /// Returns the measured rectangle occupied by a node in world space.
     pub fn node_bounds(&self, id: NodeId) -> Option<WorldBounds> {
         self.model.store.runtimes.get(&id).map(NodeRuntime::bounds)
+    }
+
+    /// Starts a custom resize gesture at a world-space pointer position.
+    pub fn begin_node_resize(
+        &mut self,
+        control: &mut crate::NodeResizeControl,
+        pointer: WorldPoint,
+    ) -> bool {
+        let Some(bounds) = self.node_bounds(control.node_id()) else {
+            return false;
+        };
+        control.begin(pointer, bounds);
+        self.announce("Resizing node");
+        true
+    }
+
+    /// Applies the current pointer position for a custom resize gesture.
+    pub fn update_node_resize(
+        &mut self,
+        control: &crate::NodeResizeControl,
+        pointer: WorldPoint,
+    ) -> bool {
+        let Some(bounds) = control.update(pointer) else {
+            return false;
+        };
+        self.model
+            .resize_node_from_bounds(control.node_id(), bounds, true)
+    }
+
+    /// Finishes a custom resize gesture and emits its final dimensions.
+    pub fn end_node_resize(
+        &mut self,
+        control: &mut crate::NodeResizeControl,
+        pointer: WorldPoint,
+    ) -> bool {
+        let Some(bounds) = control.end(pointer) else {
+            return false;
+        };
+        let changed = self
+            .model
+            .resize_node_from_bounds(control.node_id(), bounds, false);
+        if changed {
+            self.announce("Node resize finished");
+        }
+        changed
     }
 
     /// Tests a node's measured rectangle against a world-space area.
@@ -1124,27 +1169,39 @@ impl Graph {
             })
     }
 
-    fn resize_at_screen_position(&self, position: Point<Pixels>) -> Option<usize> {
+    fn resize_at_screen_position(
+        &self,
+        position: Point<Pixels>,
+    ) -> Option<(usize, crate::ResizeDirection)> {
         if !self.show_resize_handles {
             return None;
         }
-        let hit = px(8.0);
         self.model
             .nodes
             .iter()
             .enumerate()
-            .filter(|(_, node)| self.model.store.node_selected(node))
+            .filter(|(_, node)| {
+                self.model.store.node_selected(node) || node.resize_controls_always_visible
+            })
             .find_map(|(index, node)| {
-                let corner = resize_handle_position(
-                    self.viewport.world_to_screen(self.node_center(node)),
-                    self.renderer
-                        .node_appearance(node, self.viewport.zoom())
-                        .radius_pixels,
-                    node.size,
-                    self.viewport.zoom(),
-                );
-                ((corner.x - position.x).abs() <= hit && (corner.y - position.y).abs() <= hit)
-                    .then_some(index)
+                let hit = px(node.resize_control_hit_radius);
+                let center = self.viewport.world_to_screen(self.node_center(node));
+                node.resize_directions
+                    .as_deref()
+                    .unwrap_or(&RESIZE_DIRECTIONS)
+                    .iter()
+                    .copied()
+                    .find_map(|direction| {
+                        let handle = resize_handle_position(
+                            center,
+                            node.size,
+                            self.viewport.zoom(),
+                            direction,
+                        );
+                        ((handle.x - position.x).abs() <= hit
+                            && (handle.y - position.y).abs() <= hit)
+                            .then_some((index, direction))
+                    })
             })
     }
 
@@ -1595,15 +1652,44 @@ impl Graph {
     }
 }
 
+const RESIZE_DIRECTIONS: [crate::ResizeDirection; 8] = [
+    crate::ResizeDirection::NorthWest,
+    crate::ResizeDirection::North,
+    crate::ResizeDirection::NorthEast,
+    crate::ResizeDirection::East,
+    crate::ResizeDirection::SouthEast,
+    crate::ResizeDirection::South,
+    crate::ResizeDirection::SouthWest,
+    crate::ResizeDirection::West,
+];
+
 fn resize_handle_position(
     center: Point<Pixels>,
-    radius_pixels: f32,
     node_size: crate::WorldSize,
     zoom: f32,
+    direction: crate::ResizeDirection,
 ) -> Point<Pixels> {
+    let x = match direction {
+        crate::ResizeDirection::NorthWest
+        | crate::ResizeDirection::West
+        | crate::ResizeDirection::SouthWest => -1.0,
+        crate::ResizeDirection::NorthEast
+        | crate::ResizeDirection::East
+        | crate::ResizeDirection::SouthEast => 1.0,
+        _ => 0.0,
+    };
+    let y = match direction {
+        crate::ResizeDirection::NorthWest
+        | crate::ResizeDirection::North
+        | crate::ResizeDirection::NorthEast => -1.0,
+        crate::ResizeDirection::SouthWest
+        | crate::ResizeDirection::South
+        | crate::ResizeDirection::SouthEast => 1.0,
+        _ => 0.0,
+    };
     point(
-        center.x + px(radius_pixels + 5.0),
-        center.y + px(node_size.height * 0.5 * zoom).max(px(4.0)),
+        center.x + px(x * node_size.width * 0.5 * zoom),
+        center.y + px(y * node_size.height * 0.5 * zoom),
     )
 }
 
@@ -1706,6 +1792,30 @@ impl Render for Graph {
         let selected = self.scene.selected.clone();
         let show_handles = self.show_handles;
         let show_resize_handles = self.show_resize_handles;
+        let resize_directions = self
+            .model
+            .nodes
+            .iter()
+            .map(|node| node.resize_directions.clone())
+            .collect::<Vec<_>>();
+        let show_resize_controls = self
+            .model
+            .nodes
+            .iter()
+            .map(|node| node.show_resize_controls)
+            .collect::<Vec<_>>();
+        let resize_controls_always_visible = self
+            .model
+            .nodes
+            .iter()
+            .map(|node| node.resize_controls_always_visible)
+            .collect::<Vec<_>>();
+        let resize_control_colors = self
+            .model
+            .nodes
+            .iter()
+            .map(|node| node.resize_control_color)
+            .collect::<Vec<_>>();
         let selected_edges = self.scene.selected_edges.clone();
         let edges = self.layout_edges.clone();
         let edge_stride = renderer.interactive_edge_stride(edges.len(), self.playing);
@@ -2173,8 +2283,17 @@ impl Render for Graph {
                         continue;
                     }
                     let center = viewport.world_to_screen(positions[index]);
+                    let selection_size = if matches!(node_appearances[index].shape, NodeShape::None)
+                    {
+                        size(
+                            px((node_sizes[index].width * viewport.zoom()).max(1.0)),
+                            px((node_sizes[index].height * viewport.zoom()).max(1.0)),
+                        )
+                    } else {
+                        size(px(18.0), px(18.0))
+                    };
                     window.paint_quad(outline(
-                        Bounds::centered_at(center, size(px(18.0), px(18.0))),
+                        Bounds::centered_at(center, selection_size),
                         rgb(style.selection_color),
                         BorderStyle::default(),
                     ));
@@ -2198,22 +2317,98 @@ impl Render for Graph {
                             ));
                         }
                     }
-                    if show_resize_handles {
-                        let resize = resize_handle_position(
-                            center,
-                            node_appearances[index].radius_pixels,
-                            node_sizes[index],
-                            viewport.zoom(),
-                        );
-                        window.paint_quad(fill(
-                            Bounds::centered_at(resize, size(px(8.0), px(8.0))),
-                            rgb(0xffffff),
-                        ));
-                        window.paint_quad(outline(
-                            Bounds::centered_at(resize, size(px(8.0), px(8.0))),
-                            rgb(style.selection_color),
-                            BorderStyle::default(),
-                        ));
+                    if show_resize_handles && show_resize_controls[index] {
+                        let resize_color =
+                            resize_control_colors[index].unwrap_or(style.selection_color);
+                        for direction in resize_directions[index]
+                            .as_deref()
+                            .unwrap_or(&RESIZE_DIRECTIONS)
+                            .iter()
+                            .copied()
+                        {
+                            let resize = resize_handle_position(
+                                center,
+                                node_sizes[index],
+                                viewport.zoom(),
+                                direction,
+                            );
+                            let handle_size = if matches!(
+                                direction,
+                                crate::ResizeDirection::NorthWest
+                                    | crate::ResizeDirection::NorthEast
+                                    | crate::ResizeDirection::SouthEast
+                                    | crate::ResizeDirection::SouthWest
+                            ) {
+                                px(8.0)
+                            } else {
+                                px(7.0)
+                            };
+                            let corner = matches!(
+                                direction,
+                                crate::ResizeDirection::NorthWest
+                                    | crate::ResizeDirection::NorthEast
+                                    | crate::ResizeDirection::SouthEast
+                                    | crate::ResizeDirection::SouthWest
+                            );
+                            window.paint_quad(fill(
+                                Bounds::centered_at(resize, size(handle_size, handle_size)),
+                                rgb(if corner { resize_color } else { 0xffffff }),
+                            ));
+                            window.paint_quad(outline(
+                                Bounds::centered_at(resize, size(handle_size, handle_size)),
+                                rgb(resize_color),
+                                BorderStyle::default(),
+                            ));
+                        }
+                    }
+                }
+                if show_resize_handles {
+                    for (index, always_visible) in
+                        resize_controls_always_visible.iter().copied().enumerate()
+                    {
+                        if !always_visible
+                            || selected.contains(&index)
+                            || hidden[index]
+                            || !show_resize_controls[index]
+                            || visible_nodes
+                                .as_ref()
+                                .is_some_and(|visible| !visible.contains(&node_ids[index]))
+                        {
+                            continue;
+                        }
+                        let center = viewport.world_to_screen(positions[index]);
+                        let resize_color =
+                            resize_control_colors[index].unwrap_or(style.selection_color);
+                        for direction in resize_directions[index]
+                            .as_deref()
+                            .unwrap_or(&RESIZE_DIRECTIONS)
+                            .iter()
+                            .copied()
+                        {
+                            let resize = resize_handle_position(
+                                center,
+                                node_sizes[index],
+                                viewport.zoom(),
+                                direction,
+                            );
+                            let corner = matches!(
+                                direction,
+                                crate::ResizeDirection::NorthWest
+                                    | crate::ResizeDirection::NorthEast
+                                    | crate::ResizeDirection::SouthEast
+                                    | crate::ResizeDirection::SouthWest
+                            );
+                            let handle_size = if corner { px(8.0) } else { px(7.0) };
+                            window.paint_quad(fill(
+                                Bounds::centered_at(resize, size(handle_size, handle_size)),
+                                rgb(if corner { resize_color } else { 0xffffff }),
+                            ));
+                            window.paint_quad(outline(
+                                Bounds::centered_at(resize, size(handle_size, handle_size)),
+                                rgb(resize_color),
+                                BorderStyle::default(),
+                            ));
+                        }
                     }
                 }
                 if let Some((start, end)) = marquee {
@@ -2363,13 +2558,16 @@ impl Render for Graph {
                 MouseButton::Left,
                 cx.listener(|graph, event: &MouseDownEvent, window, cx| {
                     graph.focus.focus(window);
-                    if let Some(index) = graph.resize_at_screen_position(event.position) {
+                    if let Some((index, direction)) =
+                        graph.resize_at_screen_position(event.position)
+                    {
                         let node = &graph.model.nodes[index];
-                        graph.resize_node = Some((
-                            index,
+                        let mut control = crate::NodeResizeControl::new(node.id, direction);
+                        control.begin(
                             graph.screen_to_world(event.position),
                             graph.model.store.runtimes[&node.id].bounds(),
-                        ));
+                        );
+                        graph.resize_node = Some((index, control));
                         graph.announce("Resizing node");
                         graph.flush();
                         cx.notify();
@@ -2535,16 +2733,12 @@ impl Render for Graph {
             }))
             .on_mouse_move(cx.listener(|graph, event: &MouseMoveEvent, _, cx| {
                 graph.pointer_over_handle = graph.is_handle_at_screen_position(event.position);
-                if let Some((index, start, bounds)) = graph.resize_node {
+                if let Some((index, control)) = graph.resize_node {
                     let pointer = graph.screen_to_world(event.position);
-                    let resized = crate::resize_bounds(
-                        bounds,
-                        crate::ResizeDirection::SouthEast,
-                        WorldPoint::new(pointer.x - start.x, pointer.y - start.y),
-                        crate::ResizeOptions::default(),
-                    );
-                    let id = graph.model.nodes[index].id;
-                    graph.model.resize_node_from_bounds(id, resized, true);
+                    if let Some(resized) = control.update(pointer) {
+                        let id = graph.model.nodes[index].id;
+                        graph.model.resize_node_from_bounds(id, resized, true);
+                    }
                 } else if matches!(graph.connection.state, ConnectionState::Connecting { .. }) {
                     let pointer = graph.screen_to_world(event.position);
                     let target_is_end = matches!(
@@ -2624,9 +2818,12 @@ impl Render for Graph {
                 MouseButton::Left,
                 cx.listener(|graph, event: &MouseUpEvent, _, cx| {
                     let owner = graph.gestures.owner();
-                    if let Some((index, _, _)) = graph.resize_node.take() {
+                    if let Some((index, mut control)) = graph.resize_node.take() {
                         let node = graph.model.nodes[index].clone();
-                        let bounds = graph.model.store.runtimes[&node.id].bounds();
+                        let pointer = graph.screen_to_world(event.position);
+                        let bounds = control
+                            .end(pointer)
+                            .unwrap_or_else(|| graph.model.store.runtimes[&node.id].bounds());
                         graph.model.resize_node_from_bounds(node.id, bounds, false);
                         graph.announce("Node resize finished");
                     }

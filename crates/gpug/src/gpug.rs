@@ -61,5 +61,7 @@ pub use crate::input::{
     allows_viewport_gesture, CancelReason, Gesture, GestureConfig, GestureOwner, GestureRouter,
     HitTag, InputKind, PointerController,
 };
-pub use crate::node_ui::{resize_bounds, toolbar_position, ResizeDirection, ResizeOptions};
+pub use crate::node_ui::{
+    resize_bounds, toolbar_position, NodeResizeControl, ResizeDirection, ResizeOptions,
+};
 pub use crate::performance::{DirtySet, DirtyTracker, GeometryCache, Revisions, VisibilityIndex};

@@ -32,6 +32,7 @@ fn diamond_node(_: &Node, _: f32, _: &gpug::GraphStyle) -> NodeAppearance {
 /// Reacts to graph events on behalf of an example. The harness drains events
 /// once per frame and hands each one to the example before logging it.
 pub type ExampleEventHandler = fn(&mut Graph, &GraphEvent, &mut Context<Graph>);
+pub type ExampleRendererSetup = fn(&mut GraphRenderer);
 
 /// Declarative input used by the focused examples in this directory. Keeping
 /// window setup here makes every example file about the behavior it presents.
@@ -42,8 +43,10 @@ pub struct CatalogExample {
     pub edge_types: &'static [&'static str],
     pub node_count: usize,
     pub show_handles: bool,
+    pub show_resize_handles: bool,
     pub on_event: Option<ExampleEventHandler>,
     pub initial_data: Option<fn() -> GraphData>,
+    pub configure_renderer: Option<ExampleRendererSetup>,
 }
 
 impl CatalogExample {
@@ -55,8 +58,10 @@ impl CatalogExample {
             edge_types: &["default"],
             node_count: 5,
             show_handles: false,
+            show_resize_handles: false,
             on_event: None,
             initial_data: None,
+            configure_renderer: None,
         }
     }
 
@@ -76,12 +81,20 @@ impl CatalogExample {
         self.show_handles = visible;
         self
     }
+    pub const fn show_resize_handles(mut self, visible: bool) -> Self {
+        self.show_resize_handles = visible;
+        self
+    }
     pub const fn on_event(mut self, handler: ExampleEventHandler) -> Self {
         self.on_event = Some(handler);
         self
     }
     pub const fn initial_data(mut self, data: fn() -> GraphData) -> Self {
         self.initial_data = Some(data);
+        self
+    }
+    pub const fn configure_renderer(mut self, setup: ExampleRendererSetup) -> Self {
+        self.configure_renderer = Some(setup);
         self
     }
 }
@@ -95,10 +108,16 @@ pub fn run_catalog_example(example: CatalogExample) {
         cx.open_window(options, move |_, cx| {
             let graph = cx.new(|cx| {
                 if let Some(initial_data) = example.initial_data {
+                    let mut renderer = GraphRenderer::default();
+                    if let Some(setup) = example.configure_renderer {
+                        setup(&mut renderer);
+                    }
                     return Graph::builder()
                         .data(initial_data())
+                        .renderer(renderer)
                         .fit_on_load()
                         .show_handles(example.show_handles)
+                        .show_resize_handles(example.show_resize_handles)
                         .build(cx)
                         .unwrap();
                 }
@@ -149,11 +168,15 @@ pub fn run_catalog_example(example: CatalogExample) {
                         },
                     );
                 }
+                if let Some(setup) = example.configure_renderer {
+                    setup(&mut renderer);
+                }
                 Graph::builder()
                     .data(GraphData::new(nodes, edges))
                     .renderer(renderer)
                     .fit_on_load()
                     .show_handles(example.show_handles)
+                    .show_resize_handles(example.show_resize_handles)
                     .build(cx)
                     .unwrap()
             });
