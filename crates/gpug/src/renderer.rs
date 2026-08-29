@@ -88,6 +88,7 @@ pub struct GraphRenderer {
     style: GraphStyle,
     node_types: Arc<HashMap<String, Arc<dyn NodeTypeRenderer>>>,
     node_contents: Arc<HashMap<String, Arc<dyn NodeContentRenderer>>>,
+    cached_node_contents: Arc<HashSet<String>>,
     edge_types: Arc<HashMap<String, Arc<dyn EdgeTypeRenderer>>>,
     diagnostics: Option<SharedDiagnosticSink>,
     reported: Arc<Mutex<HashSet<String>>>,
@@ -160,14 +161,46 @@ impl GraphRenderer {
         name: impl Into<String>,
         renderer: impl NodeContentRenderer + 'static,
     ) {
-        Arc::make_mut(&mut self.node_contents).insert(name.into(), Arc::new(renderer));
+        let name = name.into();
+        Arc::make_mut(&mut self.node_contents).insert(name.clone(), Arc::new(renderer));
+        Arc::make_mut(&mut self.cached_node_contents).remove(&name);
+    }
+
+    /// Registers node content whose output is derived only from the supplied
+    /// node and zoom. GPUG retains the resulting view until either input
+    /// changes, avoiding repeated layout and text shaping on unchanged frames.
+    pub fn register_cached_node_content(
+        &mut self,
+        name: impl Into<String>,
+        renderer: impl NodeContentRenderer + 'static,
+    ) {
+        let name = name.into();
+        Arc::make_mut(&mut self.node_contents).insert(name.clone(), Arc::new(renderer));
+        Arc::make_mut(&mut self.cached_node_contents).insert(name);
     }
 
     pub fn node_content(&self, node: &Node, zoom: f32) -> Option<AnyElement> {
-        self.node_contents
-            .get(&node.node_type)
-            .or_else(|| self.node_contents.get("default"))
+        self.node_content_renderer(node)
+            .map(|(renderer, _)| renderer)
             .map(|renderer| renderer.render(node, zoom))
+    }
+
+    pub(crate) fn node_content_renderer(
+        &self,
+        node: &Node,
+    ) -> Option<(Arc<dyn NodeContentRenderer>, bool)> {
+        if let Some(renderer) = self.node_contents.get(&node.node_type) {
+            return Some((
+                renderer.clone(),
+                self.cached_node_contents.contains(&node.node_type),
+            ));
+        }
+        self.node_contents.get("default").map(|renderer| {
+            (
+                renderer.clone(),
+                self.cached_node_contents.contains("default"),
+            )
+        })
     }
 
     pub fn has_node_content(&self, node: &Node) -> bool {
@@ -261,6 +294,7 @@ impl GraphRenderer {
 mod tests {
     use super::*;
     use crate::WorldPoint;
+    use gpui::{div, IntoElement};
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[test]
     fn unknown_type_falls_back_to_default_registry() {
@@ -287,6 +321,20 @@ mod tests {
         renderer.node_appearance(&node, 1.0);
         renderer.node_appearance(&node, 1.0);
         assert_eq!(reports.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn content_caching_is_explicit_and_registration_can_change_policy() {
+        let mut renderer = GraphRenderer::default();
+        let node = Node::new(1u64, WorldPoint::ZERO).with_type("card");
+        renderer.register_node_content("card", |_: &Node, _: f32| div().into_any_element());
+        assert!(!renderer.node_content_renderer(&node).unwrap().1);
+
+        renderer.register_cached_node_content("card", |_: &Node, _: f32| div().into_any_element());
+        assert!(renderer.node_content_renderer(&node).unwrap().1);
+
+        renderer.register_node_content("card", |_: &Node, _: f32| div().into_any_element());
+        assert!(!renderer.node_content_renderer(&node).unwrap().1);
     }
 
     #[test]

@@ -30,6 +30,46 @@ struct SmoothZoom {
     anchor: Point<Pixels>,
 }
 
+struct CachedNodeContent {
+    renderer: Arc<dyn crate::renderer::NodeContentRenderer>,
+    node: Node,
+    zoom: f32,
+}
+
+impl Render for CachedNodeContent {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renderer.render(&self.node, self.zoom)
+    }
+}
+
+struct NodeContentItem {
+    center: Point<Pixels>,
+    size: Size<Pixels>,
+    content: Entity<CachedNodeContent>,
+}
+
+#[derive(Default)]
+struct NodeContentLayer {
+    items: Vec<NodeContentItem>,
+}
+
+impl Render for NodeContentLayer {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .absolute()
+            .size_full()
+            .children(self.items.iter().map(|item| {
+                div()
+                    .absolute()
+                    .left(item.center.x - item.size.width * 0.5)
+                    .top(item.center.y - item.size.height * 0.5)
+                    .w(item.size.width)
+                    .h(item.size.height)
+                    .child(item.content.clone())
+            }))
+    }
+}
+
 const CONNECTION_HANDLE_SIZE_WORLD: f32 = 0.7;
 const CONNECTION_HANDLE_GAP_WORLD: f32 = 0.5;
 const RECONNECT_HANDLE_SIZE_WORLD: f32 = 0.9;
@@ -85,6 +125,7 @@ struct SceneCache {
     edge_geometries: Rc<[Option<Vec<WorldPoint>>]>,
     node_appearances: Rc<[NodeAppearance]>,
     selected: Rc<[usize]>,
+    node_order: Rc<[usize]>,
     selected_edges: Rc<[(crate::EdgeId, LayoutEdge)]>,
 }
 
@@ -223,6 +264,10 @@ impl GraphDataApi {
         state.nodes.extend_from_slice(nodes);
         state.edges.clear();
         state.edges.extend_from_slice(edges);
+    }
+
+    fn has_external_consumer(&self) -> bool {
+        Arc::strong_count(&self.state) > 1
     }
 
     fn take_pending(&self) -> HashMap<NodeId, HashMap<String, String>> {
@@ -458,6 +503,10 @@ pub struct Graph {
     synced_membership_revision: u64,
     style_revision: u64,
     data_api: GraphDataApi,
+    data_api_sync_revision: (u64, u64, u64, u64, u64),
+    node_content_cache: HashMap<NodeId, Entity<CachedNodeContent>>,
+    node_content_layer: Entity<NodeContentLayer>,
+    node_content_layer_revision: Option<(u64, u64, u64, u64, u64, u32, u32, u32)>,
 }
 
 impl Graph {
@@ -498,6 +547,8 @@ impl Graph {
         let model = EditorModel::new(builder.data.nodes, builder.data.edges, builder.ownership)?;
         builder.data_api.sync(&model.nodes, &model.edges);
         let synced_membership_revision = model.store.dirty.revisions.membership;
+        let revisions = model.store.dirty.revisions;
+        let node_content_layer = cx.new(|_| NodeContentLayer::default());
         Ok(Self {
             model,
             layout_edges,
@@ -538,6 +589,16 @@ impl Graph {
             synced_membership_revision,
             style_revision: 0,
             data_api: builder.data_api,
+            data_api_sync_revision: (
+                revisions.membership,
+                revisions.node_specs,
+                revisions.edge_specs,
+                revisions.nodes,
+                revisions.selection,
+            ),
+            node_content_cache: HashMap::new(),
+            node_content_layer,
+            node_content_layer_revision: None,
         })
     }
 
@@ -1566,6 +1627,19 @@ impl Graph {
                 .enumerate()
                 .filter_map(|(index, node)| self.model.store.node_selected(node).then_some(index))
                 .collect();
+            let mut node_order = (0..self.model.nodes.len()).collect::<Vec<_>>();
+            node_order.sort_by_key(|&index| {
+                let node = &self.model.nodes[index];
+                (
+                    self.model
+                        .store
+                        .runtimes
+                        .get(&node.id)
+                        .map_or(0, |runtime| runtime.z),
+                    index,
+                )
+            });
+            self.scene.node_order = node_order.into();
             self.scene.selected_edges = self
                 .model
                 .edges
@@ -1772,7 +1846,19 @@ impl Render for Graph {
                 .expect("graph data API produced valid metadata-only node updates");
             self.flush();
         }
-        self.data_api.sync(&self.model.nodes, &self.model.edges);
+        let revisions = self.model.store.dirty.revisions;
+        let data_api_revision = (
+            revisions.membership,
+            revisions.node_specs,
+            revisions.edge_specs,
+            revisions.nodes,
+            revisions.selection,
+        );
+        if self.data_api.has_external_consumer() && self.data_api_sync_revision != data_api_revision
+        {
+            self.data_api.sync(&self.model.nodes, &self.model.edges);
+            self.data_api_sync_revision = data_api_revision;
+        }
         self.sync();
         if self.fit_on_load_pending {
             self.fit_to_view(window.viewport_size(), px(40.0));
@@ -1878,44 +1964,106 @@ impl Render for Graph {
             _ => None,
         };
 
-        let mut node_order = (0..self.model.nodes.len()).collect::<Vec<_>>();
-        node_order.sort_by_key(|&index| {
+        let revisions = self.model.store.dirty.revisions;
+        let viewport_size = window.viewport_size();
+        let content_revision = (
+            revisions.membership,
+            revisions.node_specs,
+            revisions.nodes,
+            revisions.selection,
+            revisions.viewport,
+            viewport.zoom().to_bits(),
+            (viewport_size.width / px(1.0)).to_bits(),
+            (viewport_size.height / px(1.0)).to_bits(),
+        );
+        let mut uncached_node_contents = Vec::new();
+        for index in self.scene.node_order.iter().copied() {
             let node = &self.model.nodes[index];
-            (
-                self.model
-                    .store
-                    .runtimes
-                    .get(&node.id)
-                    .map_or(0, |runtime| runtime.z),
-                index,
-            )
-        });
-        let node_contents = node_order
-            .into_iter()
-            .filter_map(|index| {
+            if hidden[index]
+                || visible_nodes
+                    .as_ref()
+                    .is_some_and(|visible| !visible.contains(&node.id))
+            {
+                continue;
+            }
+            let Some((content_renderer, cached)) = renderer.node_content_renderer(node) else {
+                continue;
+            };
+            if cached {
+                continue;
+            }
+            let center = viewport.world_to_screen(positions[index]);
+            let width = px((node_sizes[index].width * viewport.zoom()).max(1.0));
+            let height = px((node_sizes[index].height * viewport.zoom()).max(1.0));
+            uncached_node_contents.push(
+                div()
+                    .absolute()
+                    .left(center.x - width * 0.5)
+                    .top(center.y - height * 0.5)
+                    .w(width)
+                    .h(height)
+                    .child(content_renderer.render(node, viewport.zoom())),
+            );
+        }
+        if self.node_content_layer_revision != Some(content_revision) {
+            self.node_content_cache
+                .retain(|id, _| self.model.store.node_lookup.contains_key(id));
+            let mut items = Vec::new();
+            for index in self.scene.node_order.iter().copied() {
                 let node = &self.model.nodes[index];
                 if hidden[index]
                     || visible_nodes
                         .as_ref()
                         .is_some_and(|visible| !visible.contains(&node.id))
                 {
-                    return None;
+                    continue;
                 }
-                let content = renderer.node_content(node, viewport.zoom())?;
-                let center = viewport.world_to_screen(positions[index]);
-                let width = px((node_sizes[index].width * viewport.zoom()).max(1.0));
-                let height = px((node_sizes[index].height * viewport.zoom()).max(1.0));
-                Some(
-                    div()
-                        .absolute()
-                        .left(center.x - width * 0.5)
-                        .top(center.y - height * 0.5)
-                        .w(width)
-                        .h(height)
-                        .child(content),
-                )
-            })
-            .collect::<Vec<_>>();
+                let Some((content_renderer, cached)) = renderer.node_content_renderer(node) else {
+                    continue;
+                };
+                if !cached {
+                    continue;
+                }
+                let content = if let Some(content) = self.node_content_cache.get(&node.id).cloned()
+                {
+                    let node = node.clone();
+                    cx.update_entity(&content, |cached, cx| {
+                        if cached.node != node
+                            || cached.zoom.to_bits() != viewport.zoom().to_bits()
+                            || !Arc::ptr_eq(&cached.renderer, &content_renderer)
+                        {
+                            cached.node = node;
+                            cached.zoom = viewport.zoom();
+                            cached.renderer = content_renderer;
+                            cx.notify();
+                        }
+                    });
+                    content
+                } else {
+                    let content = cx.new(|_| CachedNodeContent {
+                        renderer: content_renderer,
+                        node: node.clone(),
+                        zoom: viewport.zoom(),
+                    });
+                    self.node_content_cache.insert(node.id, content.clone());
+                    content
+                };
+                items.push(NodeContentItem {
+                    center: viewport.world_to_screen(positions[index]),
+                    size: size(
+                        px((node_sizes[index].width * viewport.zoom()).max(1.0)),
+                        px((node_sizes[index].height * viewport.zoom()).max(1.0)),
+                    ),
+                    content,
+                });
+            }
+            cx.update_entity(&self.node_content_layer, |layer, cx| {
+                layer.items = items;
+                cx.notify();
+            });
+            self.node_content_layer_revision = Some(content_revision);
+        }
+        let node_content_layer = self.node_content_layer.clone();
         if self.data_api.has_pending() {
             cx.notify();
         }
@@ -2280,6 +2428,22 @@ impl Render for Graph {
 
                 if show_handles {
                     let handle_size = px(CONNECTION_HANDLE_SIZE_WORLD * viewport.zoom());
+                    let outer_half = handle_size * 0.5;
+                    let inner_half = (outer_half - px(1.0)).max(px(0.0));
+                    let mut handle_borders = Path::new(point(px(0.0), px(0.0)));
+                    let mut handle_fills = Path::new(point(px(0.0), px(0.0)));
+                    macro_rules! push_square {
+                        ($path:expr, $center:expr, $half:expr) => {{
+                            let center = $center;
+                            let half = $half;
+                            let a = point(center.x - half, center.y - half);
+                            let b = point(center.x + half, center.y - half);
+                            let c = point(center.x + half, center.y + half);
+                            let d = point(center.x - half, center.y + half);
+                            $path.push_triangle((a, b, c), st);
+                            $path.push_triangle((a, c, d), st);
+                        }};
+                    }
                     for (index, position) in positions.iter().enumerate() {
                         if hidden[index] {
                             continue;
@@ -2300,17 +2464,14 @@ impl Render for Graph {
                                 source_handle_position,
                                 viewport.zoom(),
                             );
-                            window.paint_quad(fill(
-                                Bounds::centered_at(handle, size(handle_size, handle_size)),
-                                rgb(0xffffff),
-                            ));
-                            window.paint_quad(outline(
-                                Bounds::centered_at(handle, size(handle_size, handle_size)),
-                                rgb(0x1e90ff),
-                                BorderStyle::default(),
-                            ));
+                            push_square!(handle_borders, handle, outer_half);
+                            if inner_half > px(0.0) {
+                                push_square!(handle_fills, handle, inner_half);
+                            }
                         }
                     }
+                    window.paint_path(handle_borders, rgb(0x1e90ff));
+                    window.paint_path(handle_fills, rgb(0xffffff));
                 }
 
                 for &index in selected.iter() {
@@ -2775,8 +2936,8 @@ impl Render for Graph {
                 graph.flush();
             }))
             .on_mouse_move(cx.listener(|graph, event: &MouseMoveEvent, _, cx| {
-                graph.pointer_over_handle = graph.is_handle_at_screen_position(event.position);
                 if let Some((index, control)) = graph.resize_node {
+                    graph.pointer_over_handle = false;
                     let pointer = graph.screen_to_world(event.position);
                     if let Some(resized) = control.update(pointer) {
                         let id = graph.model.nodes[index].id;
@@ -2794,11 +2955,13 @@ impl Render for Graph {
                     let target = graph
                         .handle_at_screen_position(event.position, target_is_end)
                         .map(|(key, center)| graph.connection_handle(key, center));
+                    graph.pointer_over_handle = target.is_some();
                     graph
                         .connection
                         .update(pointer, target.as_ref(), std::iter::empty());
                     graph.model.store.dirty.mark_connection();
                 } else if let Some(items) = graph.drag_nodes.clone() {
+                    graph.pointer_over_handle = false;
                     if let Some(pointer) = &mut graph.pointer {
                         if !pointer.update(ViewportPoint::new(
                             event.position.x / px(1.0),
@@ -2822,6 +2985,7 @@ impl Render for Graph {
                     graph.model.move_nodes(&targets, true);
                     graph.layout_initialized = false;
                 } else if let Some(start) = graph.selection_start {
+                    graph.pointer_over_handle = false;
                     graph.selection_current = Some(event.position);
                     let a = graph.screen_to_world(start);
                     let b = graph.screen_to_world(event.position);
@@ -2851,6 +3015,7 @@ impl Render for Graph {
                     graph.pointer_over_graph_item = false;
                     graph.pointer_over_handle = false;
                 } else {
+                    graph.pointer_over_handle = graph.is_handle_at_screen_position(event.position);
                     graph.pointer_over_graph_item =
                         graph.graph_item_at_screen_position(event.position);
                 }
@@ -2969,7 +3134,8 @@ impl Render for Graph {
                 }
             }))
             .child(graph_canvas)
-            .children(node_contents)
+            .child(node_content_layer)
+            .children(uncached_node_contents)
             .children(edge_labels)
             .child(controls)
             .child(play_button)
