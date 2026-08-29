@@ -254,6 +254,8 @@ pub struct GraphBuilder {
     interactive_layout: bool,
     fit_on_load: bool,
     show_handles: bool,
+    target_handle_position: Position,
+    source_handle_position: Position,
     show_resize_handles: bool,
     only_render_visible_elements: bool,
     selection_mode: SelectionMode,
@@ -276,6 +278,8 @@ impl Default for GraphBuilder {
             interactive_layout: false,
             fit_on_load: false,
             show_handles: false,
+            target_handle_position: Position::Left,
+            source_handle_position: Position::Right,
             show_resize_handles: false,
             only_render_visible_elements: false,
             selection_mode: SelectionMode::Partial,
@@ -356,6 +360,14 @@ impl GraphBuilder {
         self
     }
 
+    /// Places the default target and source handles on the requested sides.
+    /// Existing graphs retain the conventional left-to-right arrangement.
+    pub fn handle_positions(mut self, target: Position, source: Position) -> Self {
+        self.target_handle_position = target;
+        self.source_handle_position = source;
+        self
+    }
+
     /// Shows a south-east resize handle on selected nodes. Disabled by default.
     pub fn show_resize_handles(mut self, visible: bool) -> Self {
         self.show_resize_handles = visible;
@@ -419,6 +431,8 @@ pub struct Graph {
     sim_tick: u64,
     fit_on_load_pending: bool,
     show_handles: bool,
+    target_handle_position: Position,
+    source_handle_position: Position,
     show_resize_handles: bool,
     pan_drag_position: Option<Point<Pixels>>,
     pointer_over_graph_item: bool,
@@ -428,6 +442,7 @@ pub struct Graph {
     selection_start: Option<Point<Pixels>>,
     selection_current: Option<Point<Pixels>>,
     drag_nodes: Option<Vec<(usize, WorldPoint)>>,
+    temporary_edge_preview: Option<(WorldPoint, WorldPoint)>,
     focus: FocusHandle,
     connection: ConnectionController,
     next_edge_id: u64,
@@ -496,6 +511,8 @@ impl Graph {
             sim_tick: 0,
             fit_on_load_pending: builder.fit_on_load,
             show_handles: builder.show_handles,
+            target_handle_position: builder.target_handle_position,
+            source_handle_position: builder.source_handle_position,
             show_resize_handles: builder.show_resize_handles,
             pan_drag_position: None,
             pointer_over_graph_item: false,
@@ -505,6 +522,7 @@ impl Graph {
             selection_start: None,
             selection_current: None,
             drag_nodes: None,
+            temporary_edge_preview: None,
             focus: cx.focus_handle().tab_stop(true),
             connection: ConnectionController::default(),
             next_edge_id,
@@ -574,6 +592,12 @@ impl Graph {
 
     pub fn edges(&self) -> &[Edge] {
         &self.model.edges
+    }
+
+    /// Sets transient edge geometry painted by the graph without adding it to
+    /// persistent graph data. Passing `None` clears the preview.
+    pub fn set_temporary_edge_preview(&mut self, preview: Option<(WorldPoint, WorldPoint)>) {
+        self.temporary_edge_preview = preview;
     }
 
     pub fn node(&self, id: NodeId) -> Option<&Node> {
@@ -1097,6 +1121,8 @@ impl Graph {
                         .node_appearance(node, self.viewport.zoom())
                         .radius_pixels,
                     kind,
+                    self.target_handle_position,
+                    self.source_handle_position,
                     self.viewport.zoom(),
                 );
                 let dx = (handle_position.x - position.x).abs();
@@ -1112,10 +1138,7 @@ impl Graph {
                         id: None,
                         kind,
                     },
-                    WorldPoint::new(
-                        self.viewport.screen_to_world(handle_position).x,
-                        self.node_center(node).y,
-                    ),
+                    self.viewport.screen_to_world(handle_position),
                 ))
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
@@ -1206,15 +1229,10 @@ impl Graph {
     }
 
     fn connection_handle(&self, key: HandleKey, center: WorldPoint) -> Handle {
-        let position = if center.x
-            < self
-                .model
-                .node(key.node)
-                .map_or(center.x, |node| self.node_center(node).x)
-        {
-            Position::Left
+        let position = if key.kind == HandleKind::Target {
+            self.target_handle_position
         } else {
-            Position::Right
+            self.source_handle_position
         };
         Handle {
             key,
@@ -1471,9 +1489,9 @@ impl Graph {
                         EdgeKind::Bezier => {
                             let (curve, _) = crate::connection::bezier_path(
                                 a,
-                                Position::Right,
+                                self.source_handle_position,
                                 b,
-                                Position::Left,
+                                self.target_handle_position,
                                 0.25,
                             );
                             (0..=12)
@@ -1496,9 +1514,9 @@ impl Graph {
                         EdgeKind::SmoothStep => {
                             crate::connection::smooth_step_path(
                                 a,
-                                Position::Right,
+                                self.source_handle_position,
                                 b,
-                                Position::Left,
+                                self.target_handle_position,
                                 20.0,
                             )
                             .0
@@ -1697,17 +1715,21 @@ fn connection_handle_position(
     center: Point<Pixels>,
     radius_pixels: f32,
     kind: HandleKind,
+    target_position: Position,
+    source_position: Position,
     zoom: f32,
 ) -> Point<Pixels> {
     let offset = px(radius_pixels + CONNECTION_HANDLE_GAP_WORLD * zoom);
-    point(
-        if kind == HandleKind::Target {
-            center.x - offset
-        } else {
-            center.x + offset
-        },
-        center.y,
-    )
+    match if kind == HandleKind::Target {
+        target_position
+    } else {
+        source_position
+    } {
+        Position::Left => point(center.x - offset, center.y),
+        Position::Top => point(center.x, center.y - offset),
+        Position::Right => point(center.x + offset, center.y),
+        Position::Bottom => point(center.x, center.y + offset),
+    }
 }
 
 fn world_bounds(nodes: &[Node], store: &EditorStore) -> Option<WorldBounds> {
@@ -1791,6 +1813,8 @@ impl Render for Graph {
         let edge_geometries = self.scene.edge_geometries.clone();
         let selected = self.scene.selected.clone();
         let show_handles = self.show_handles;
+        let target_handle_position = self.target_handle_position;
+        let source_handle_position = self.source_handle_position;
         let show_resize_handles = self.show_resize_handles;
         let resize_directions = self
             .model
@@ -1820,6 +1844,7 @@ impl Render for Graph {
         let edges = self.layout_edges.clone();
         let edge_stride = renderer.interactive_edge_stride(edges.len(), self.playing);
         let reconnecting_edge = reconnecting_edge_id(&self.connection.state);
+        let temporary_edge_preview = self.temporary_edge_preview;
         let default_node = NodeAppearance {
             color: style.node_color,
             radius_pixels: renderer.node_radius_pixels(viewport.zoom()),
@@ -1844,13 +1869,11 @@ impl Render for Graph {
                         .node_appearance(node, self.viewport.zoom())
                         .radius_pixels,
                     from.kind,
+                    self.target_handle_position,
+                    self.source_handle_position,
                     self.viewport.zoom(),
                 ));
-                (
-                    WorldPoint::new(origin.x, self.node_center(node).y),
-                    *pointer,
-                    *valid,
-                )
+                (origin, *pointer, *valid)
             }),
             _ => None,
         };
@@ -1944,6 +1967,22 @@ impl Render for Graph {
                     edge_path.push_triangle((p2a, p1b, p2b), st);
                 }
                 window.paint_path(edge_path, rgba((style.edge_color << 8) | 0x30));
+
+                if let Some((from, to)) = temporary_edge_preview {
+                    let from = viewport.world_to_screen(from);
+                    let to = viewport.world_to_screen(to);
+                    let delta = point(to.x - from.x, to.y - from.y);
+                    let length = delta.magnitude() as f32;
+                    let dots = (length / 10.0).floor().max(2.0) as usize;
+                    for index in 0..=dots {
+                        let t = index as f32 / dots as f32;
+                        let center = point(from.x + delta.x * t, from.y + delta.y * t);
+                        window.paint_quad(fill(
+                            Bounds::centered_at(center, size(px(3.0), px(3.0))),
+                            rgba(0x7f8792d9),
+                        ));
+                    }
+                }
 
                 for (edge_index, edge) in edges.iter().enumerate().step_by(edge_stride) {
                     if reconnecting_edge == Some(edge_ids[edge_index]) {
@@ -2257,6 +2296,8 @@ impl Render for Graph {
                                 center,
                                 node_appearances[index].radius_pixels,
                                 kind,
+                                target_handle_position,
+                                source_handle_position,
                                 viewport.zoom(),
                             );
                             window.paint_quad(fill(
@@ -2304,6 +2345,8 @@ impl Render for Graph {
                                 center,
                                 node_appearances[index].radius_pixels,
                                 kind,
+                                target_handle_position,
+                                source_handle_position,
                                 viewport.zoom(),
                             );
                             window.paint_quad(fill(

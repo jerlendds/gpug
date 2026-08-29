@@ -5,9 +5,9 @@ use gpug::{
     Edge, Graph, GraphData, GraphRenderer, Node, NodeAppearance, NodeShape, WorldPoint, WorldSize,
 };
 use gpui::{
-    App, AppContext, Application, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Path, Pixels, Point,
-    Render, Styled, Window, WindowOptions, canvas, div, point, px, rgb, rgba,
+    canvas, div, point, px, rgb, rgba, App, AppContext, Application, Context, Entity, FocusHandle,
+    Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    ParentElement, Path, Pixels, Point, Render, Styled, Window, WindowOptions,
 };
 
 #[derive(Clone)]
@@ -413,15 +413,11 @@ mod tests {
 
     #[test]
     fn rejects_non_hex_input_characters() {
-        assert!(
-            "#a0B9fF"
-                .chars()
-                .all(|ch| ch == '#' || ch.is_ascii_hexdigit())
-        );
-        assert!(
-            !"#red123"
-                .chars()
-                .all(|ch| ch == '#' || ch.is_ascii_hexdigit())
-        );
+        assert!("#a0B9fF"
+            .chars()
+            .all(|ch| ch == '#' || ch.is_ascii_hexdigit()));
+        assert!(!"#red123"
+            .chars()
+            .all(|ch| ch == '#' || ch.is_ascii_hexdigit()));
     }
 }
