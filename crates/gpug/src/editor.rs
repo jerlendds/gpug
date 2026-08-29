@@ -83,6 +83,7 @@ pub struct NodeRuntime {
     pub measured: WorldSize,
     pub handles: Vec<Handle>,
     pub z: i32,
+    z_before_selection: Option<i32>,
     pub dragging: bool,
     pub resizing: bool,
     pub revision: u64,
@@ -95,6 +96,7 @@ impl NodeRuntime {
             measured: node.size,
             handles: Vec::new(),
             z: 0,
+            z_before_selection: None,
             dragging: false,
             resizing: false,
             revision: 0,
@@ -107,6 +109,54 @@ impl NodeRuntime {
 }
 
 impl EditorStore {
+    fn raise_selected_node(&mut self, id: NodeId) -> bool {
+        let next = self
+            .runtimes
+            .values()
+            .map(|runtime| runtime.z)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let Some(runtime) = self.runtimes.get_mut(&id) else {
+            return false;
+        };
+        if runtime.z_before_selection.is_none() {
+            runtime.z_before_selection = Some(runtime.z);
+        }
+        if runtime.z == next {
+            return false;
+        }
+        runtime.z = next;
+        runtime.revision = runtime.revision.wrapping_add(1);
+        self.dirty.mark_node(id);
+        true
+    }
+
+    fn restore_deselected_node(&mut self, id: NodeId) -> bool {
+        let Some(runtime) = self.runtimes.get_mut(&id) else {
+            return false;
+        };
+        let Some(previous) = runtime.z_before_selection.take() else {
+            return false;
+        };
+        runtime.z = previous;
+        runtime.revision = runtime.revision.wrapping_add(1);
+        self.dirty.mark_node(id);
+        true
+    }
+
+    fn apply_selection_stacking(&mut self, changes: &[NodeChange]) {
+        for change in changes {
+            if let NodeChange::Select { id, selected } = change {
+                if *selected {
+                    self.raise_selected_node(*id);
+                } else {
+                    self.restore_deselected_node(*id);
+                }
+            }
+        }
+    }
+
     /// The node's position anchor in world coordinates.
     pub fn node_position_absolute(&self, node: &Node) -> WorldPoint {
         self.runtimes
@@ -814,7 +864,7 @@ impl EditorStore {
             .iter()
             .filter_map(|node| {
                 let runtime = self.runtimes.get(&node.id)?;
-                intersects(rect, runtime.bounds(), mode).then_some(node.id)
+                bounds_intersect(rect, runtime.bounds(), mode).then_some(node.id)
             })
             .collect()
     }
@@ -879,6 +929,7 @@ impl EditorModel {
         }
         let mut projected = self.nodes.clone();
         apply_node_changes(&mut projected, &self.edges, &changes)?;
+        self.store.apply_selection_stacking(&changes);
         if self.store.ownership == GraphOwnership::External {
             self.store.apply_selection_overlay(&changes, &[]);
             if changes
@@ -1015,6 +1066,7 @@ impl EditorModel {
         crate::data::compile_edges(&projected_nodes, &projected_edges)?;
         validate_changed_connections(&projected_edges, &edge_changes)?;
 
+        self.store.apply_selection_stacking(&node_changes);
         if self.store.ownership == GraphOwnership::External {
             self.store
                 .apply_selection_overlay(&node_changes, &edge_changes);
@@ -1502,7 +1554,8 @@ impl EditorModel {
     }
 }
 
-fn intersects(a: WorldBounds, b: WorldBounds, mode: SelectionMode) -> bool {
+/// Tests two world-space rectangles using containment or overlap semantics.
+pub fn bounds_intersect(a: WorldBounds, b: WorldBounds, mode: SelectionMode) -> bool {
     let a_right = a.origin.x + a.size.width;
     let a_bottom = a.origin.y + a.size.height;
     let b_right = b.origin.x + b.size.width;
@@ -1642,6 +1695,23 @@ mod tests {
             Err(GraphDataError::DuplicateConnection { .. })
         ));
         assert_eq!(model.take_changes(), (vec![], vec![]));
+    }
+
+    #[test]
+    fn most_recently_selected_node_is_raised_without_a_drag() {
+        let nodes = vec![
+            Node::new(1u64, WorldPoint::ZERO),
+            Node::new(2u64, WorldPoint::ZERO),
+        ];
+        let mut model = EditorModel::new(nodes, vec![], GraphOwnership::Internal).unwrap();
+
+        assert!(model.select_node(NodeId(1), false, false));
+        assert!(model.select_node(NodeId(2), false, false));
+
+        assert!(model.store.runtimes[&NodeId(2)].z > model.store.runtimes[&NodeId(1)].z);
+        assert!(!model.store.runtimes[&NodeId(2)].dragging);
+        assert!(model.clear_selection());
+        assert_eq!(model.store.runtimes[&NodeId(2)].z, 0);
     }
 
     #[test]

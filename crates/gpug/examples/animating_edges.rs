@@ -1,8 +1,8 @@
 //! A paint-time edge animation gallery.
 use gpui::{
-    App, AppContext, Application, Bounds, Context, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Path, Pixels, Point, Render,
-    Styled, Window, WindowOptions, canvas, div, fill, point, px, rgb, rgba, size,
+    canvas, div, fill, point, px, rgb, rgba, size, App, AppContext, Application, Bounds, Context,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Path, Pixels, Point, Render, Styled, Window, WindowOptions,
 };
 use std::time::Instant;
 

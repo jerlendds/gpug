@@ -38,6 +38,11 @@ pub struct Node {
     pub draggable: bool,
     pub selectable: bool,
     pub connectable: bool,
+    /// Treats the node body as an invisible source/target handle.
+    ///
+    /// When this is enabled, use `custom_handle` to reserve a region that can
+    /// still initiate node dragging.
+    pub connectable_body: bool,
     pub deletable: bool,
     pub focusable: bool,
     pub origin: WorldPoint,
@@ -66,6 +71,7 @@ impl Node {
             draggable: true,
             selectable: true,
             connectable: true,
+            connectable_body: false,
             deletable: true,
             focusable: true,
             origin: WorldPoint::new(0.5, 0.5),
@@ -96,6 +102,12 @@ impl Node {
     }
     pub fn with_origin(mut self, origin: WorldPoint) -> Self {
         self.origin = origin;
+        self
+    }
+
+    /// Makes the complete node body participate in connection hit testing.
+    pub fn with_connectable_body(mut self) -> Self {
+        self.connectable_body = true;
         self
     }
 

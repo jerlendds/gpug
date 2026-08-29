@@ -44,11 +44,11 @@ pub use crate::coordinates::{
 pub use crate::data::{GraphData, GraphDataError, LayoutEdge};
 pub use crate::edge::{Edge, EdgeMarker};
 pub use crate::editor::{
-    apply_edge_changes, apply_node_changes, constrain_node_position, diff_edge_changes,
-    diff_node_changes, expand_parent_changes, node_center, EdgeChange, EdgeChangeMiddleware,
-    EdgeId, EditorModel, EditorStore, GraphOwnership, Handle, HandleKey, HandleKind,
-    HandleValidation, NodeChange, NodeChangeMiddleware, NodeRuntime, Position, RendererRegistry,
-    SelectionMode,
+    apply_edge_changes, apply_node_changes, bounds_intersect, constrain_node_position,
+    diff_edge_changes, diff_node_changes, expand_parent_changes, node_center, EdgeChange,
+    EdgeChangeMiddleware, EdgeId, EditorModel, EditorStore, GraphOwnership, Handle, HandleKey,
+    HandleKind, HandleValidation, NodeChange, NodeChangeMiddleware, NodeRuntime, Position,
+    RendererRegistry, SelectionMode,
 };
 pub use crate::extensions::{
     get_nodes_bounds, minimap_nodes, Background, BackgroundPattern, BoundsOptions, MiniMapNode,

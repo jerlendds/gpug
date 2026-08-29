@@ -1,7 +1,7 @@
 use gpug::{ContextMenuTarget, Edge, Graph, GraphData, Node, NodeId, WorldPoint, WorldSize};
 use gpui::{
-    App, AppContext, Application, Context, Entity, MouseButton, MouseDownEvent, Pixels, Point,
-    Render, Window, WindowOptions, div, point, prelude::*, px, rgb,
+    div, point, prelude::*, px, rgb, App, AppContext, Application, Context, Entity, MouseButton,
+    MouseDownEvent, Pixels, Point, Render, Window, WindowOptions,
 };
 
 struct OpenMenu {

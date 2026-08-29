@@ -9,8 +9,10 @@ use crate::coordinates::ViewportPoint;
 use crate::coordinates::{Viewport, WorldBounds, WorldPoint};
 use crate::data::{GraphData, GraphDataError, LayoutEdge};
 use crate::edge::Edge;
+use crate::editor::{
+    bounds_intersect, EditorModel, EditorStore, GraphOwnership, NodeRuntime, SelectionMode,
+};
 use crate::editor::{EdgeChange, NodeChange};
-use crate::editor::{EditorModel, EditorStore, GraphOwnership, SelectionMode};
 use crate::editor::{Handle, HandleKey, HandleKind, Position};
 use crate::input::{Gesture, GestureOwner, GestureRouter, PointerController};
 use crate::layout::{
@@ -606,6 +608,44 @@ impl Graph {
         &self.model.store
     }
 
+    /// Returns the measured rectangle occupied by a node in world space.
+    pub fn node_bounds(&self, id: NodeId) -> Option<WorldBounds> {
+        self.model.store.runtimes.get(&id).map(NodeRuntime::bounds)
+    }
+
+    /// Tests a node's measured rectangle against a world-space area.
+    ///
+    /// Hidden or not-yet-measured nodes do not intersect. `Partial` accepts
+    /// any overlap (including touching edges); `Full` requires the area to
+    /// completely contain the node.
+    pub fn is_node_intersecting(&self, id: NodeId, area: WorldBounds, mode: SelectionMode) -> bool {
+        self.model
+            .node(id)
+            .filter(|node| !node.hidden)
+            .and_then(|_| self.node_bounds(id))
+            .is_some_and(|bounds| bounds_intersect(area, bounds, mode))
+    }
+
+    /// Finds visible, measured nodes intersecting a world-space area.
+    pub fn intersecting_nodes(&self, area: WorldBounds, mode: SelectionMode) -> HashSet<NodeId> {
+        self.model
+            .nodes
+            .iter()
+            .filter(|node| !node.hidden && self.is_node_intersecting(node.id, area, mode))
+            .map(|node| node.id)
+            .collect()
+    }
+
+    /// Finds nodes intersecting `id`, excluding that node from the result.
+    pub fn get_intersecting_nodes(&self, id: NodeId, mode: SelectionMode) -> HashSet<NodeId> {
+        let Some(bounds) = self.node_bounds(id) else {
+            return HashSet::new();
+        };
+        let mut result = self.intersecting_nodes(bounds, mode);
+        result.remove(&id);
+        result
+    }
+
     fn sync(&mut self) {
         let membership_revision = self.model.store.dirty.revisions.membership;
         if !self.model.store.dirty.peek().membership
@@ -903,25 +943,42 @@ impl Graph {
 
     fn node_at_screen_position(&self, position: Point<Pixels>) -> Option<usize> {
         let hit_radius = px(self.renderer.style().hit_radius_pixels);
-        self.model.nodes.iter().position(|node| {
-            let center = self.viewport.world_to_screen(self.node_center(node));
-            let (half_width, half_height) = if self.renderer.has_node_content(node) {
-                let measured = self
-                    .model
-                    .store
-                    .runtimes
-                    .get(&node.id)
-                    .map_or(node.size, |runtime| runtime.measured);
-                (
-                    px(measured.width * self.viewport.zoom() * 0.5),
-                    px(measured.height * self.viewport.zoom() * 0.5),
-                )
-            } else {
-                (hit_radius, hit_radius)
-            };
-            (center.x - position.x).abs() <= half_width
-                && (center.y - position.y).abs() <= half_height
-        })
+        self.model
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                if node.hidden {
+                    return None;
+                }
+                let center = self.viewport.world_to_screen(self.node_center(node));
+                let (half_width, half_height) = if self.renderer.has_node_content(node) {
+                    let measured = self
+                        .model
+                        .store
+                        .runtimes
+                        .get(&node.id)
+                        .map_or(node.size, |runtime| runtime.measured);
+                    (
+                        px(measured.width * self.viewport.zoom() * 0.5),
+                        px(measured.height * self.viewport.zoom() * 0.5),
+                    )
+                } else {
+                    (hit_radius, hit_radius)
+                };
+                let hit = (center.x - position.x).abs() <= half_width
+                    && (center.y - position.y).abs() <= half_height;
+                hit.then_some((
+                    self.model
+                        .store
+                        .runtimes
+                        .get(&node.id)
+                        .map_or(0, |runtime| runtime.z),
+                    index,
+                ))
+            })
+            .max()
+            .map(|(_, index)| index)
     }
 
     fn node_allows_drag_at_screen_position(&self, node: &Node, position: Point<Pixels>) -> bool {
@@ -948,10 +1005,7 @@ impl Graph {
             .nodes
             .iter()
             .filter_map(|node| {
-                if !node.connectable
-                    || node.hidden
-                    || (!self.show_handles && !self.model.store.node_selected(node))
-                {
+                if !node.connectable || node.hidden {
                     return None;
                 }
                 let center = self.viewport.world_to_screen(self.node_center(node));
@@ -960,6 +1014,38 @@ impl Graph {
                 } else {
                     HandleKind::Source
                 };
+                if node.connectable_body {
+                    let measured = self
+                        .model
+                        .store
+                        .runtimes
+                        .get(&node.id)
+                        .map_or(node.size, |runtime| runtime.measured);
+                    let half_width = px(measured.width * self.viewport.zoom() * 0.5);
+                    let half_height = px(measured.height * self.viewport.zoom() * 0.5);
+                    let inside = (center.x - position.x).abs() <= half_width
+                        && (center.y - position.y).abs() <= half_height;
+                    // A whole-body port otherwise consumes every pointer down.
+                    // Reserve an explicit custom drag handle for node movement,
+                    // while still accepting drops over that region.
+                    let reserved_for_drag = !end
+                        && node.custom_handle.is_some()
+                        && self.node_allows_drag_at_screen_position(node, position);
+                    if inside && !reserved_for_drag {
+                        return Some((
+                            0.0,
+                            HandleKey {
+                                node: node.id,
+                                id: None,
+                                kind,
+                            },
+                            self.node_center(node),
+                        ));
+                    }
+                }
+                if !self.show_handles && !self.model.store.node_selected(node) {
+                    return None;
+                }
                 let handle_position = connection_handle_position(
                     center,
                     self.renderer
@@ -1659,12 +1745,22 @@ impl Render for Graph {
             _ => None,
         };
 
-        let node_contents = self
-            .model
-            .nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| {
+        let mut node_order = (0..self.model.nodes.len()).collect::<Vec<_>>();
+        node_order.sort_by_key(|&index| {
+            let node = &self.model.nodes[index];
+            (
+                self.model
+                    .store
+                    .runtimes
+                    .get(&node.id)
+                    .map_or(0, |runtime| runtime.z),
+                index,
+            )
+        });
+        let node_contents = node_order
+            .into_iter()
+            .filter_map(|index| {
+                let node = &self.model.nodes[index];
                 if hidden[index]
                     || visible_nodes
                         .as_ref()
