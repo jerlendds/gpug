@@ -12,8 +12,8 @@ use crate::editor::{EditorModel, EditorStore, GraphOwnership, SelectionMode};
 use crate::editor::{Handle, HandleKey, HandleKind, Position};
 use crate::input::{Gesture, GestureOwner, GestureRouter, PointerController};
 use crate::layout::{
-    AnimatedBatchLayout, BatchLayout, ForceAtlas2, Layout, LayoutFit, LayoutOptions, LayoutStatus,
-    apply_fit, step_with_budget,
+    apply_fit, step_with_budget, AnimatedBatchLayout, BatchLayout, ForceAtlas2, Layout, LayoutFit,
+    LayoutOptions, LayoutStatus,
 };
 use crate::node::{Node, NodeId};
 use crate::renderer::GraphRenderer;
@@ -766,33 +766,32 @@ impl Graph {
             .nodes
             .iter()
             .filter_map(|node| {
-            if !node.connectable
-                || node.hidden
-                || (!self.show_handles && !self.model.store.node_selected(node))
-            {
-                return None;
-            }
-            let center = self.viewport.world_to_screen(self.node_center(node));
-            let kind = if end {
-                HandleKind::Target
-            } else {
-                HandleKind::Source
-            };
-            let handle_position = connection_handle_position(
-                center,
-                self.renderer
-                    .node_appearance(node, self.viewport.zoom())
-                    .radius_pixels,
-                kind,
-            );
-            let dx = (handle_position.x - position.x).abs();
-            let dy = (handle_position.y - position.y).abs();
-            let center_distance = (center.x - position.x).abs();
-            // The fallback handles can be close to the node center at low
-            // zoom. Do not let their generous hit box swallow the endpoint
-            // hotspot used for reconnecting a selected edge.
-            (dx <= hit && dy <= hit && dx < center_distance)
-                .then_some((
+                if !node.connectable
+                    || node.hidden
+                    || (!self.show_handles && !self.model.store.node_selected(node))
+                {
+                    return None;
+                }
+                let center = self.viewport.world_to_screen(self.node_center(node));
+                let kind = if end {
+                    HandleKind::Target
+                } else {
+                    HandleKind::Source
+                };
+                let handle_position = connection_handle_position(
+                    center,
+                    self.renderer
+                        .node_appearance(node, self.viewport.zoom())
+                        .radius_pixels,
+                    kind,
+                );
+                let dx = (handle_position.x - position.x).abs();
+                let dy = (handle_position.y - position.y).abs();
+                let center_distance = (center.x - position.x).abs();
+                // The fallback handles can be close to the node center at low
+                // zoom. Do not let their generous hit box swallow the endpoint
+                // hotspot used for reconnecting a selected edge.
+                (dx <= hit && dy <= hit && dx < center_distance).then_some((
                     (dx / px(1.0)).powi(2) + (dy / px(1.0)).powi(2),
                     HandleKey {
                         node: node.id,

@@ -1,4 +1,4 @@
-use gpui::{Pixels, Point, point, px};
+use gpui::{point, px, Pixels, Point};
 
 /// A position in GPUG's renderer-independent graph world.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

@@ -1805,16 +1805,12 @@ mod tests {
         let mut store = EditorStore::default();
         store.rebuild(&nodes, &[]);
         let rect = WorldBounds::new(WorldPoint::ZERO, WorldSize::new(10.0, 10.0));
-        assert!(
-            store
-                .nodes_in_rect(&nodes, rect, SelectionMode::Partial)
-                .contains(&NodeId(1))
-        );
-        assert!(
-            store
-                .nodes_in_rect(&nodes, rect, SelectionMode::Full)
-                .contains(&NodeId(1))
-        );
+        assert!(store
+            .nodes_in_rect(&nodes, rect, SelectionMode::Partial)
+            .contains(&NodeId(1)));
+        assert!(store
+            .nodes_in_rect(&nodes, rect, SelectionMode::Full)
+            .contains(&NodeId(1)));
     }
 
     #[test]
@@ -1942,21 +1938,15 @@ mod tests {
             Node::new(3u64, WorldPoint::ZERO),
         ];
         let changes = diff_node_changes(&old, &new);
-        assert!(
-            changes
-                .iter()
-                .any(|change| matches!(change,NodeChange::Remove{id}if *id==NodeId(2)))
-        );
-        assert!(
-            changes
-                .iter()
-                .any(|change| matches!(change,NodeChange::Replace{id,..}if *id==NodeId(1)))
-        );
-        assert!(
-            changes
-                .iter()
-                .any(|change| matches!(change,NodeChange::Add{item,..}if item.id==NodeId(3)))
-        );
+        assert!(changes
+            .iter()
+            .any(|change| matches!(change,NodeChange::Remove{id}if *id==NodeId(2))));
+        assert!(changes
+            .iter()
+            .any(|change| matches!(change,NodeChange::Replace{id,..}if *id==NodeId(1))));
+        assert!(changes
+            .iter()
+            .any(|change| matches!(change,NodeChange::Add{item,..}if item.id==NodeId(3))));
     }
     #[test]
     fn middleware_can_filter_changes() {
@@ -2002,8 +1992,7 @@ mod tests {
 
     #[test]
     fn invalid_measurements_leave_runtime_and_dirty_revisions_unchanged() {
-        let node = Node::new(1u64, WorldPoint::ZERO)
-            .with_size(WorldSize::new(10.0, 20.0));
+        let node = Node::new(1u64, WorldPoint::ZERO).with_size(WorldSize::new(10.0, 20.0));
         let mut store = EditorStore::default();
         store.rebuild(&[node], &[]);
         store.take_dirty();
@@ -2042,11 +2031,9 @@ mod tests {
             NodeId(2),
             WorldBounds::new(WorldPoint::new(-20.0, 10.0), WorldSize::new(10.0, 10.0)),
         );
-        assert!(
-            changes
-                .iter()
-                .any(|change| matches!(change,NodeChange::Dimensions{id,..}if *id==NodeId(1)))
-        );
+        assert!(changes
+            .iter()
+            .any(|change| matches!(change,NodeChange::Dimensions{id,..}if *id==NodeId(1))));
     }
 
     #[test]
@@ -2061,11 +2048,9 @@ mod tests {
             EditorModel::new(vec![parent, child], vec![], GraphOwnership::Internal).unwrap();
         model.move_nodes(&[(NodeId(2), WorldPoint::new(-20.0, 50.0))], true);
         let (changes, _) = model.take_changes();
-        assert!(
-            changes.iter().any(
-                |change| matches!(change, NodeChange::Dimensions { id, .. } if *id == NodeId(1))
-            )
-        );
+        assert!(changes
+            .iter()
+            .any(|change| matches!(change, NodeChange::Dimensions { id, .. } if *id == NodeId(1))));
     }
 
     #[test]
