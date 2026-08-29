@@ -14,8 +14,8 @@ use crate::editor::{EditorModel, EditorStore, GraphOwnership, SelectionMode};
 use crate::editor::{Handle, HandleKey, HandleKind, Position};
 use crate::input::{Gesture, GestureOwner, GestureRouter, PointerController};
 use crate::layout::{
-    AnimatedBatchLayout, BatchLayout, ForceAtlas2, Layout, LayoutFit, LayoutOptions, LayoutStatus,
-    apply_fit, step_with_budget,
+    apply_fit, step_with_budget, AnimatedBatchLayout, BatchLayout, ForceAtlas2, Layout, LayoutFit,
+    LayoutOptions, LayoutStatus,
 };
 use crate::node::{Node, NodeId};
 use crate::renderer::GraphRenderer;
@@ -2585,7 +2585,7 @@ impl Render for Graph {
 
 #[cfg(test)]
 mod tests {
-    use super::{GraphDataApi, reconnecting_edge_id};
+    use super::{reconnecting_edge_id, GraphDataApi};
     use crate::{
         ConnectionIntent, ConnectionState, Edge, EdgeId, HandleKey, HandleKind, Node, NodeId,
         WorldPoint,
