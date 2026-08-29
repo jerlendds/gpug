@@ -25,7 +25,7 @@ pub fn generate_small_world_graph_with_seed(
             let target = (source + offset) % node_count;
             let pair = ordered_pair(source, target);
             if pairs.insert(pair) {
-                edges.push(Edge::new(pair.0, pair.1));
+                edges.push(Edge::new_with_id(pair.0, pair.1, edges.len() as u64));
             }
         }
     }
@@ -37,7 +37,7 @@ pub fn generate_small_world_graph_with_seed(
     ) {
         let pair = ordered_pair(edge.source.index(), edge.target.index());
         if pairs.insert(pair) {
-            edges.push(Edge::new(pair.0, pair.1));
+            edges.push(Edge::new_with_id(pair.0, pair.1, edges.len() as u64));
         }
     }
     edges
@@ -75,7 +75,11 @@ impl SmallWorld {
     }
 
     pub fn shortcut_probability(mut self, probability: f64) -> Self {
-        self.shortcut_probability = probability.clamp(0.0, 1.0);
+        self.shortcut_probability = if probability.is_finite() {
+            probability.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         self
     }
 
@@ -129,5 +133,12 @@ mod tests {
             .map(|edge| ordered_pair(edge.source.index(), edge.target.index()))
             .collect();
         assert_eq!(pairs.len(), edges.len());
+    }
+
+    #[test]
+    fn seeded_generation_includes_stable_edge_ids() {
+        let first = generate_small_world_graph_with_seed(100, 3, 0.01, 42);
+        let second = generate_small_world_graph_with_seed(100, 3, 0.01, 42);
+        assert_eq!(first, second);
     }
 }

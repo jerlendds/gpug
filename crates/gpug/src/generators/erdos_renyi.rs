@@ -1,7 +1,7 @@
+use crate::GraphData;
 use crate::edge::Edge;
 use crate::generators::utils::generate_nodes_with_seed;
 use crate::generators::utils::rand_f64;
-use crate::GraphData;
 
 /// Generates a deterministic undirected G(n, p) graph in expected O(n + m).
 pub fn generate_erdos_renyi_graph(n: usize, probability: f64) -> Vec<Edge> {
@@ -13,7 +13,11 @@ pub fn generate_erdos_renyi_graph_with_seed(
     probability: f64,
     mut seed: u64,
 ) -> Vec<Edge> {
-    let probability = probability.clamp(0.0, 1.0);
+    let probability = if probability.is_finite() {
+        probability.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     if n < 2 || probability == 0.0 {
         return Vec::new();
     }
@@ -21,7 +25,7 @@ pub fn generate_erdos_renyi_graph_with_seed(
         let mut edges = Vec::with_capacity(n.saturating_mul(n.saturating_sub(1)) / 2);
         for target in 1..n {
             for source in 0..target {
-                edges.push(Edge::new(source, target));
+                edges.push(Edge::new_with_id(source, target, edges.len() as u64));
             }
         }
         return edges;
@@ -41,7 +45,11 @@ pub fn generate_erdos_renyi_graph_with_seed(
             target += 1;
         }
         if target < n {
-            edges.push(Edge::new(source as usize, target));
+            edges.push(Edge::new_with_id(
+                source as usize,
+                target,
+                edges.len() as u64,
+            ));
         }
     }
     edges
@@ -89,6 +97,14 @@ mod tests {
     fn handles_probability_extremes() {
         assert!(generate_erdos_renyi_graph(10, 0.0).is_empty());
         assert_eq!(generate_erdos_renyi_graph(10, 1.0).len(), 45);
+        assert!(generate_erdos_renyi_graph(10, f64::NAN).is_empty());
+    }
+
+    #[test]
+    fn seeded_generation_includes_stable_edge_ids() {
+        let first = generate_erdos_renyi_graph_with_seed(100, 0.1, 42);
+        let second = generate_erdos_renyi_graph_with_seed(100, 0.1, 42);
+        assert_eq!(first, second);
     }
 
     #[test]

@@ -24,3 +24,45 @@ impl Default for GraphStyle {
         }
     }
 }
+
+impl GraphStyle {
+    pub(crate) fn sanitized(mut self) -> Self {
+        let defaults = Self::default();
+        self.node_radius_world =
+            finite_non_negative_or(self.node_radius_world, defaults.node_radius_world);
+        self.edge_width_pixels =
+            finite_non_negative_or(self.edge_width_pixels, defaults.edge_width_pixels);
+        self.hit_radius_pixels =
+            finite_non_negative_or(self.hit_radius_pixels, defaults.hit_radius_pixels);
+        self
+    }
+}
+
+pub(crate) fn finite_non_negative_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() && value >= 0.0 {
+        value
+    } else {
+        fallback
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitizes_invalid_geometry_values() {
+        let style = GraphStyle {
+            node_radius_world: f32::NAN,
+            edge_width_pixels: f32::INFINITY,
+            hit_radius_pixels: -1.0,
+            ..GraphStyle::default()
+        }
+        .sanitized();
+        let defaults = GraphStyle::default();
+
+        assert_eq!(style.node_radius_world, defaults.node_radius_world);
+        assert_eq!(style.edge_width_pixels, defaults.edge_width_pixels);
+        assert_eq!(style.hit_radius_pixels, defaults.hit_radius_pixels);
+    }
+}

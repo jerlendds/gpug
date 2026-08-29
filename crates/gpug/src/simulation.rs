@@ -1,5 +1,6 @@
 use rayon::prelude::*;
 
+use crate::coordinates::WorldPoint;
 use crate::data::LayoutEdge;
 
 const NONE: usize = usize::MAX;
@@ -15,7 +16,10 @@ struct Quad {
     mass_y: f32,
     mass: f32,
     children: [usize; 4],
-    bodies: Vec<usize>,
+    #[cfg(test)]
+    body_start: usize,
+    #[cfg(test)]
+    body_end: usize,
 }
 
 impl Quad {
@@ -30,14 +34,20 @@ impl Quad {
 /// Force-directed layout workspace. It keeps topology and force buffers in
 /// structure-of-arrays form and uses ForceAtlas2's Barnes-Hut theta default.
 pub struct LayoutWorkspace {
+    position_xs: Vec<f32>,
+    position_ys: Vec<f32>,
     fx: Vec<f32>,
     fy: Vec<f32>,
     old_fx: Vec<f32>,
     old_fy: Vec<f32>,
     adjacency_offsets: Vec<usize>,
     adjacency_targets: Vec<usize>,
-    topology_key: (usize, usize, usize),
+    topology_node_count: usize,
+    topology_edges: Vec<LayoutEdge>,
     tree: Vec<Quad>,
+    tree_indices: Vec<usize>,
+    tree_scratch: Vec<usize>,
+    body_leaf: Vec<usize>,
     speed: f32,
     speed_efficiency: f32,
 }
@@ -45,14 +55,20 @@ pub struct LayoutWorkspace {
 impl Default for LayoutWorkspace {
     fn default() -> Self {
         Self {
+            position_xs: Vec::new(),
+            position_ys: Vec::new(),
             fx: Vec::new(),
             fy: Vec::new(),
             old_fx: Vec::new(),
             old_fy: Vec::new(),
             adjacency_offsets: Vec::new(),
             adjacency_targets: Vec::new(),
-            topology_key: (0, 0, 0),
+            topology_node_count: 0,
+            topology_edges: Vec::new(),
             tree: Vec::new(),
+            tree_indices: Vec::new(),
+            tree_scratch: Vec::new(),
+            body_leaf: Vec::new(),
             speed: 1.0,
             speed_efficiency: 1.0,
         }
@@ -60,10 +76,30 @@ impl Default for LayoutWorkspace {
 }
 
 impl LayoutWorkspace {
+    /// Advances an interleaved position buffer while retaining the simulation's
+    /// structure-of-arrays scratch storage across frames.
+    pub fn step_positions(&mut self, positions: &mut [WorldPoint], edges: &[LayoutEdge]) -> f32 {
+        let mut xs = std::mem::take(&mut self.position_xs);
+        let mut ys = std::mem::take(&mut self.position_ys);
+        xs.clear();
+        ys.clear();
+        xs.extend(positions.iter().map(|position| position.x));
+        ys.extend(positions.iter().map(|position| position.y));
+
+        let energy = self.step(&mut xs, &mut ys, edges);
+        for ((position, x), y) in positions.iter_mut().zip(&xs).zip(&ys) {
+            *position = WorldPoint::new(*x, *y);
+        }
+        self.position_xs = xs;
+        self.position_ys = ys;
+        energy
+    }
+
     fn rebuild_adjacency(&mut self, node_count: usize, edges: &[LayoutEdge]) {
-        let pointer = edges.as_ptr() as usize;
-        let key = (node_count, edges.len(), pointer);
-        if self.topology_key == key && self.adjacency_offsets.len() == node_count + 1 {
+        if self.topology_node_count == node_count
+            && self.topology_edges == edges
+            && self.adjacency_offsets.len() == node_count + 1
+        {
             return;
         }
 
@@ -95,7 +131,9 @@ impl LayoutWorkspace {
                 cursors[target] += 1;
             }
         }
-        self.topology_key = key;
+        self.topology_node_count = node_count;
+        self.topology_edges.clear();
+        self.topology_edges.extend_from_slice(edges);
     }
 
     fn build_tree(&mut self, xs: &[f32], ys: &[f32]) {
@@ -114,12 +152,19 @@ impl LayoutWorkspace {
         let center_x = (min_x + max_x) * 0.5;
         let center_y = (min_y + max_y) * 0.5;
         let half_size = ((max_x - min_x).max(max_y - min_y) * 0.5).max(1.0) + 0.01;
-        let bodies: Vec<_> = (0..xs.len()).collect();
+        self.tree_indices.clear();
+        self.tree_indices.extend(0..xs.len());
+        self.tree_scratch.resize(xs.len(), 0);
+        self.body_leaf.resize(xs.len(), NONE);
         build_quad(
             &mut self.tree,
+            &mut self.tree_indices,
+            &mut self.tree_scratch,
+            &mut self.body_leaf,
             xs,
             ys,
-            bodies,
+            0,
+            xs.len(),
             center_x,
             center_y,
             half_size,
@@ -132,6 +177,14 @@ impl LayoutWorkspace {
         let n = xs.len().min(ys.len());
         if n == 0 {
             return 0.0;
+        }
+        for (x, y) in xs[..n].iter_mut().zip(&mut ys[..n]) {
+            if !x.is_finite() {
+                *x = 0.0;
+            }
+            if !y.is_finite() {
+                *y = 0.0;
+            }
         }
         self.rebuild_adjacency(n, edges);
         self.build_tree(&xs[..n], &ys[..n]);
@@ -149,6 +202,7 @@ impl LayoutWorkspace {
         const REPULSION: f32 = 120.0;
         const ATTRACTION: f32 = 0.03;
         let tree = &self.tree;
+        let body_leaf = &self.body_leaf;
         let offsets = &self.adjacency_offsets;
         let targets = &self.adjacency_targets;
         self.fx
@@ -159,7 +213,16 @@ impl LayoutWorkspace {
                 let x = xs[index];
                 let y = ys[index];
                 let (mut repulsion_x, mut repulsion_y) = (0.0, 0.0);
-                accumulate_repulsion(tree, 0, index, x, y, &mut repulsion_x, &mut repulsion_y);
+                accumulate_repulsion(
+                    tree,
+                    body_leaf,
+                    0,
+                    index,
+                    x,
+                    y,
+                    &mut repulsion_x,
+                    &mut repulsion_y,
+                );
                 *force_x = REPULSION * repulsion_x;
                 *force_y = REPULSION * repulsion_y;
 
@@ -240,15 +303,20 @@ impl LayoutWorkspace {
 #[allow(clippy::too_many_arguments)]
 fn build_quad(
     tree: &mut Vec<Quad>,
+    indices: &mut [usize],
+    scratch: &mut [usize],
+    body_leaf: &mut [usize],
     xs: &[f32],
     ys: &[f32],
-    bodies: Vec<usize>,
+    body_start: usize,
+    body_end: usize,
     center_x: f32,
     center_y: f32,
     half_size: f32,
     depth: usize,
 ) -> usize {
     let index = tree.len();
+    let bodies = &indices[body_start..body_end];
     let mass = bodies.len() as f32;
     let (sum_x, sum_y) = bodies.iter().fold((0.0, 0.0), |(sum_x, sum_y), &body| {
         (sum_x + xs[body], sum_y + ys[body])
@@ -261,21 +329,42 @@ fn build_quad(
         mass_y: sum_y / mass,
         mass,
         children: [NONE; 4],
-        bodies: Vec::new(),
+        #[cfg(test)]
+        body_start,
+        #[cfg(test)]
+        body_end,
     });
-    if bodies.len() <= 1 || depth >= MAX_TREE_DEPTH {
-        tree[index].bodies = bodies;
+    let first = bodies[0];
+    let coincident = bodies
+        .iter()
+        .all(|&body| xs[body] == xs[first] && ys[body] == ys[first]);
+    if bodies.len() <= 1 || coincident || depth >= MAX_TREE_DEPTH {
+        for &body in bodies {
+            body_leaf[body] = index;
+        }
         return index;
     }
 
-    let mut partitions = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-    for body in bodies {
+    let mut counts = [0usize; 4];
+    for &body in bodies {
         let quadrant = usize::from(xs[body] >= center_x) | (usize::from(ys[body] >= center_y) << 1);
-        partitions[quadrant].push(body);
+        counts[quadrant] += 1;
     }
+    let mut starts = [body_start; 4];
+    for quadrant in 1..4 {
+        starts[quadrant] = starts[quadrant - 1] + counts[quadrant - 1];
+    }
+    let mut cursors = starts;
+    for &body in bodies {
+        let quadrant = usize::from(xs[body] >= center_x) | (usize::from(ys[body] >= center_y) << 1);
+        scratch[cursors[quadrant]] = body;
+        cursors[quadrant] += 1;
+    }
+    indices[body_start..body_end].copy_from_slice(&scratch[body_start..body_end]);
+
     let child_half = half_size * 0.5;
-    for (quadrant, partition) in partitions.into_iter().enumerate() {
-        if partition.is_empty() {
+    for quadrant in 0..4 {
+        if counts[quadrant] == 0 {
             continue;
         }
         let child_x = center_x
@@ -292,9 +381,13 @@ fn build_quad(
             };
         tree[index].children[quadrant] = build_quad(
             tree,
+            indices,
+            scratch,
+            body_leaf,
             xs,
             ys,
-            partition,
+            starts[quadrant],
+            starts[quadrant] + counts[quadrant],
             child_x,
             child_y,
             child_half,
@@ -307,6 +400,7 @@ fn build_quad(
 #[allow(clippy::too_many_arguments)]
 fn accumulate_repulsion(
     tree: &[Quad],
+    body_leaf: &[usize],
     quad_index: usize,
     body: usize,
     x: f32,
@@ -315,14 +409,15 @@ fn accumulate_repulsion(
     force_y: &mut f32,
 ) {
     let quad = &tree[quad_index];
-    if !quad.bodies.is_empty() {
-        for &other in &quad.bodies {
-            if other == body {
-                continue;
-            }
-            let dx = quad.mass_x - x;
-            let dy = quad.mass_y - y;
-            let inverse_distance = 1.0 / (dx * dx + dy * dy + 0.01);
+    if quad.children.iter().all(|&child| child == NONE) {
+        let contains_body = body_leaf[body] == quad_index;
+        let mass = quad.mass - f32::from(contains_body);
+        if mass > 0.0 {
+            let mass_x = (quad.mass_x * quad.mass - if contains_body { x } else { 0.0 }) / mass;
+            let mass_y = (quad.mass_y * quad.mass - if contains_body { y } else { 0.0 }) / mass;
+            let dx = mass_x - x;
+            let dy = mass_y - y;
+            let inverse_distance = mass / (dx * dx + dy * dy + 0.01);
             *force_x -= dx * inverse_distance;
             *force_y -= dy * inverse_distance;
         }
@@ -343,7 +438,7 @@ fn accumulate_repulsion(
     }
     for &child in &quad.children {
         if child != NONE {
-            accumulate_repulsion(tree, child, body, x, y, force_x, force_y);
+            accumulate_repulsion(tree, body_leaf, child, body, x, y, force_x, force_y);
         }
     }
 }
@@ -368,5 +463,89 @@ mod tests {
         ];
         let _ = LayoutWorkspace::default().step(&mut xs, &mut ys, &edges);
         assert!(xs.iter().chain(&ys).all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn barnes_hut_sanitizes_non_finite_coordinates() {
+        let mut xs = vec![f32::NAN, f32::INFINITY];
+        let mut ys = vec![f32::NEG_INFINITY, 1.0];
+        let energy = LayoutWorkspace::default().step(&mut xs, &mut ys, &[]);
+        assert!(energy.is_finite());
+        assert!(xs.iter().chain(&ys).all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn adjacency_rebuilds_when_edges_change_in_place() {
+        let mut workspace = LayoutWorkspace::default();
+        let mut edges = vec![LayoutEdge {
+            source: 0,
+            target: 1,
+        }];
+        workspace.rebuild_adjacency(3, &edges);
+        assert_eq!(workspace.adjacency_offsets, vec![0, 1, 2, 2]);
+        assert_eq!(workspace.adjacency_targets, vec![1, 0]);
+
+        let pointer = edges.as_ptr();
+        edges[0].target = 2;
+        assert_eq!(edges.as_ptr(), pointer);
+        workspace.rebuild_adjacency(3, &edges);
+
+        assert_eq!(workspace.adjacency_offsets, vec![0, 1, 1, 2]);
+        assert_eq!(workspace.adjacency_targets, vec![2, 0]);
+    }
+
+    #[test]
+    fn coincident_bodies_collapse_into_one_aggregate_leaf() {
+        let xs = vec![42.0; 10_000];
+        let ys = vec![-7.0; 10_000];
+        let mut workspace = LayoutWorkspace::default();
+
+        workspace.build_tree(&xs, &ys);
+
+        assert_eq!(workspace.tree.len(), 1);
+        assert_eq!(workspace.tree[0].body_start, 0);
+        assert_eq!(workspace.tree[0].body_end, xs.len());
+        assert!(workspace.body_leaf.iter().all(|&leaf| leaf == 0));
+
+        let (mut force_x, mut force_y) = (0.0, 0.0);
+        accumulate_repulsion(
+            &workspace.tree,
+            &workspace.body_leaf,
+            0,
+            0,
+            xs[0],
+            ys[0],
+            &mut force_x,
+            &mut force_y,
+        );
+        assert_eq!((force_x, force_y), (0.0, 0.0));
+    }
+
+    #[test]
+    fn tree_storage_is_reused_between_builds() {
+        let xs: Vec<_> = (0..128).map(|index| index as f32).collect();
+        let ys: Vec<_> = (0..128).map(|index| (index % 11) as f32).collect();
+        let mut workspace = LayoutWorkspace::default();
+        workspace.build_tree(&xs, &ys);
+        let capacities = (
+            workspace.tree.capacity(),
+            workspace.tree_indices.capacity(),
+            workspace.tree_scratch.capacity(),
+            workspace.body_leaf.capacity(),
+        );
+
+        workspace.build_tree(&xs, &ys);
+
+        assert_eq!(workspace.tree_indices.len(), xs.len());
+        assert_eq!(workspace.body_leaf.len(), xs.len());
+        assert_eq!(
+            capacities,
+            (
+                workspace.tree.capacity(),
+                workspace.tree_indices.capacity(),
+                workspace.tree_scratch.capacity(),
+                workspace.body_leaf.capacity(),
+            )
+        );
     }
 }

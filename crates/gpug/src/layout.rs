@@ -4,10 +4,17 @@ use crate::coordinates::{LayoutPoint, WorldBounds, WorldPoint};
 use crate::data::LayoutEdge;
 use crate::simulation::LayoutWorkspace;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum LayoutStatus {
     Running { energy: f32 },
     Converged,
+    Failed { error: String },
+}
+
+impl LayoutStatus {
+    pub fn is_finished(&self) -> bool {
+        matches!(self, Self::Converged | Self::Failed { .. })
+    }
 }
 
 pub trait Layout {
@@ -53,19 +60,33 @@ impl<L: BatchLayout> Layout for BatchLayoutAdapter<L> {
 
     fn step(&mut self, positions: &mut [WorldPoint], edges: &[LayoutEdge]) -> LayoutStatus {
         if self.finished {
-            return LayoutStatus::Converged;
+            return match &self.error {
+                Some(error) => LayoutStatus::Failed {
+                    error: error.clone(),
+                },
+                None => LayoutStatus::Converged,
+            };
         }
         let mut layout_positions: Vec<LayoutPoint> =
             positions.iter().copied().map(Into::into).collect();
-        if let Err(error) = self.inner.layout(&mut layout_positions, edges) {
-            self.error = Some(error);
+        let status = if let Err(error) = self.inner.layout(&mut layout_positions, edges) {
+            self.error = Some(error.clone());
+            LayoutStatus::Failed { error }
+        } else if layout_positions
+            .iter()
+            .any(|position| !position.x.is_finite() || !position.y.is_finite())
+        {
+            let error = "batch layout produced non-finite coordinates".to_string();
+            self.error = Some(error.clone());
+            LayoutStatus::Failed { error }
         } else {
             for (position, layout_position) in positions.iter_mut().zip(layout_positions) {
                 *position = layout_position.into();
             }
-        }
+            LayoutStatus::Converged
+        };
         self.finished = true;
-        LayoutStatus::Converged
+        status
     }
 }
 
@@ -76,6 +97,7 @@ pub struct AnimatedBatchLayout<L> {
     current_frame: usize,
     frames: usize,
     prepared: bool,
+    error: Option<String>,
 }
 
 impl<L> AnimatedBatchLayout<L> {
@@ -87,21 +109,32 @@ impl<L> AnimatedBatchLayout<L> {
             current_frame: 0,
             frames: frames.max(1),
             prepared: false,
+            error: None,
         }
     }
 }
 
 impl<L: BatchLayout> Layout for AnimatedBatchLayout<L> {
-    fn initialize(&mut self, positions: &[WorldPoint], _edges: &[LayoutEdge]) {
+    fn initialize(&mut self, positions: &[WorldPoint], edges: &[LayoutEdge]) {
         self.start = positions.to_vec();
         self.target = positions.to_vec();
         self.current_frame = 0;
         self.prepared = false;
+        self.error = None;
+        self.batch.initialize(positions, edges);
     }
 
     fn step(&mut self, positions: &mut [WorldPoint], edges: &[LayoutEdge]) -> LayoutStatus {
+        if let Some(error) = &self.error {
+            return LayoutStatus::Failed {
+                error: error.clone(),
+            };
+        }
         if !self.prepared {
-            let _ = self.batch.step(&mut self.target, edges);
+            if let LayoutStatus::Failed { error } = self.batch.step(&mut self.target, edges) {
+                self.error = Some(error.clone());
+                return LayoutStatus::Failed { error };
+            }
             self.prepared = true;
         }
         self.current_frame = (self.current_frame + 1).min(self.frames);
@@ -138,11 +171,23 @@ impl ForceAtlas2 {
 
 impl Layout for ForceAtlas2 {
     fn step(&mut self, positions: &mut [WorldPoint], edges: &[LayoutEdge]) -> LayoutStatus {
-        let mut xs: Vec<_> = positions.iter().map(|position| position.x).collect();
-        let mut ys: Vec<_> = positions.iter().map(|position| position.y).collect();
-        let energy = self.workspace.step(&mut xs, &mut ys, edges);
-        for ((position, x), y) in positions.iter_mut().zip(xs).zip(ys) {
-            *position = WorldPoint::new(x, y);
+        if positions
+            .iter()
+            .any(|position| !position.x.is_finite() || !position.y.is_finite())
+        {
+            return LayoutStatus::Failed {
+                error: "layout received non-finite coordinates".into(),
+            };
+        }
+        let energy = self.workspace.step_positions(positions, edges);
+        if !energy.is_finite()
+            || positions
+                .iter()
+                .any(|position| !position.x.is_finite() || !position.y.is_finite())
+        {
+            return LayoutStatus::Failed {
+                error: "layout produced non-finite output".into(),
+            };
         }
         if energy < 0.001 {
             LayoutStatus::Converged
@@ -187,7 +232,7 @@ pub(crate) fn step_with_budget(
     let started = Instant::now();
     loop {
         let status = layout.step(positions, edges);
-        if status == LayoutStatus::Converged || started.elapsed() >= budget {
+        if status.is_finished() || started.elapsed() >= budget {
             return status;
         }
     }
@@ -195,6 +240,12 @@ pub(crate) fn step_with_budget(
 
 pub(crate) fn apply_fit(positions: &mut [WorldPoint], fit: LayoutFit) {
     if positions.is_empty() || fit == LayoutFit::Preserve {
+        return;
+    }
+    if positions
+        .iter()
+        .any(|position| !position.x.is_finite() || !position.y.is_finite())
+    {
         return;
     }
     let (mut min_x, mut max_x) = (f32::INFINITY, f32::NEG_INFINITY);
@@ -220,6 +271,14 @@ pub(crate) fn apply_fit(positions: &mut [WorldPoint], fit: LayoutFit) {
             padding,
             preserve_aspect_ratio,
         } => {
+            if !bounds.origin.x.is_finite()
+                || !bounds.origin.y.is_finite()
+                || !bounds.size.width.is_finite()
+                || !bounds.size.height.is_finite()
+                || !padding.is_finite()
+            {
+                return;
+            }
             let source_width = (max_x - min_x).max(0.0001);
             let source_height = (max_y - min_y).max(0.0001);
             let target_width = (bounds.size.width - 2.0 * padding).max(0.0001);
@@ -250,6 +309,20 @@ mod tests {
 
     struct OffsetBatch;
 
+    struct FailingBatch;
+
+    struct NonFiniteBatch;
+
+    impl BatchLayout for FailingBatch {
+        fn layout(
+            &mut self,
+            _positions: &mut [LayoutPoint],
+            _edges: &[LayoutEdge],
+        ) -> Result<(), String> {
+            Err("batch layout failed".into())
+        }
+    }
+
     impl BatchLayout for OffsetBatch {
         fn layout(
             &mut self,
@@ -260,6 +333,17 @@ mod tests {
                 position.x += 10.0;
                 position.y += 20.0;
             }
+            Ok(())
+        }
+    }
+
+    impl BatchLayout for NonFiniteBatch {
+        fn layout(
+            &mut self,
+            positions: &mut [LayoutPoint],
+            _edges: &[LayoutEdge],
+        ) -> Result<(), String> {
+            positions[0].x = f64::NAN;
             Ok(())
         }
     }
@@ -303,5 +387,43 @@ mod tests {
         assert_eq!(positions, vec![WorldPoint::new(5.0, 10.0)]);
         assert_eq!(layout.step(&mut positions, &[]), LayoutStatus::Converged);
         assert_eq!(positions, vec![WorldPoint::new(10.0, 20.0)]);
+    }
+
+    #[test]
+    fn batch_adapter_reports_failure() {
+        let mut adapter = BatchLayoutAdapter::new(FailingBatch);
+        let mut positions = vec![WorldPoint::new(1.0, 2.0)];
+        let expected = LayoutStatus::Failed {
+            error: "batch layout failed".into(),
+        };
+
+        assert_eq!(adapter.step(&mut positions, &[]), expected);
+        assert_eq!(adapter.step(&mut positions, &[]), expected);
+        assert_eq!(positions, vec![WorldPoint::new(1.0, 2.0)]);
+    }
+
+    #[test]
+    fn batch_adapter_rejects_non_finite_output() {
+        let mut adapter = BatchLayoutAdapter::new(NonFiniteBatch);
+        let mut positions = vec![WorldPoint::new(1.0, 2.0)];
+        assert!(matches!(
+            adapter.step(&mut positions, &[]),
+            LayoutStatus::Failed { .. }
+        ));
+        assert_eq!(positions, vec![WorldPoint::new(1.0, 2.0)]);
+    }
+
+    #[test]
+    fn animated_batch_layout_reports_failure() {
+        let mut layout = AnimatedBatchLayout::new(FailingBatch, 2);
+        let mut positions = vec![WorldPoint::new(1.0, 2.0)];
+        layout.initialize(&positions, &[]);
+        let expected = LayoutStatus::Failed {
+            error: "batch layout failed".into(),
+        };
+
+        assert_eq!(layout.step(&mut positions, &[]), expected);
+        assert_eq!(layout.step(&mut positions, &[]), expected);
+        assert_eq!(positions, vec![WorldPoint::new(1.0, 2.0)]);
     }
 }

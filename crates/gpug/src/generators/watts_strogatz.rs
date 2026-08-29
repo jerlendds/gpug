@@ -1,7 +1,7 @@
+use crate::GraphData;
 use crate::edge::Edge;
 use crate::generators::utils::generate_nodes_with_seed;
 use crate::generators::utils::rand_f32;
-use crate::GraphData;
 
 use std::collections::HashSet;
 
@@ -27,7 +27,11 @@ pub fn generate_watts_strogatz_graph_with_seed(
         return Vec::new();
     }
 
-    let rewiring_prob = beta.clamp(0.0, 1.0);
+    let rewiring_prob = if beta.is_finite() {
+        beta.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
 
     let mut adjacency: Vec<HashSet<usize>> = (0..n)
         .map(|_| HashSet::with_capacity(effective_k * 2))
@@ -87,15 +91,20 @@ pub fn generate_watts_strogatz_graph_with_seed(
         }
     }
 
-    let mut edges = Vec::with_capacity(n * effective_k);
+    let mut pairs = Vec::with_capacity(n * effective_k);
     for source in 0..n {
         for &target in &adjacency[source] {
             if source < target {
-                edges.push(Edge::new(source, target));
+                pairs.push((source, target));
             }
         }
     }
-    edges
+    pairs.sort_unstable();
+    pairs
+        .into_iter()
+        .enumerate()
+        .map(|(id, (source, target))| Edge::new_with_id(source, target, id as u64))
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -122,7 +131,11 @@ impl WattsStrogatz {
     }
 
     pub fn rewiring_probability(mut self, probability: f32) -> Self {
-        self.rewiring_probability = probability;
+        self.rewiring_probability = if probability.is_finite() {
+            probability.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         self
     }
 
@@ -141,5 +154,17 @@ impl WattsStrogatz {
                 self.seed,
             ),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seeded_generation_includes_stable_edge_ids() {
+        let first = generate_watts_strogatz_graph_with_seed(100, 3, 0.2, 42);
+        let second = generate_watts_strogatz_graph_with_seed(100, 3, 0.2, 42);
+        assert_eq!(first, second);
     }
 }

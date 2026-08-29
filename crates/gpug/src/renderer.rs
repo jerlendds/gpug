@@ -1,21 +1,203 @@
-use crate::GraphStyle;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::sync::{Arc, Mutex};
 
-#[derive(Clone, Debug, Default)]
+use crate::{
+    Diagnostic, Edge, EdgeId, GraphStyle, Node, NodeId, NodeRuntime, SharedDiagnosticSink,
+    WorldPoint, WorldSize,
+};
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum EditorAction {
+    SelectNode { node: NodeId, multi: bool },
+    MoveNode { node: NodeId, position: WorldPoint },
+    ResizeNode { node: NodeId, size: WorldSize },
+    SelectEdge { edge: EdgeId },
+    DeleteSelection,
+}
+pub struct NodeRenderContext<'a> {
+    pub node_id: NodeId,
+    pub runtime: &'a NodeRuntime,
+    actions: &'a mut Vec<EditorAction>,
+}
+impl NodeRenderContext<'_> {
+    pub fn dispatch(&mut self, action: EditorAction) {
+        self.actions.push(action)
+    }
+}
+pub struct EdgePaintContext<'a> {
+    pub edge_id: EdgeId,
+    pub selected: bool,
+    actions: &'a mut Vec<EditorAction>,
+}
+impl EdgePaintContext<'_> {
+    pub fn dispatch(&mut self, action: EditorAction) {
+        self.actions.push(action)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodeShape {
+    Square,
+    Diamond,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NodeAppearance {
+    pub color: u32,
+    pub radius_pixels: f32,
+    pub shape: NodeShape,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EdgeAppearance {
+    pub color: u32,
+    pub width_pixels: f32,
+}
+
+pub trait NodeTypeRenderer: Send + Sync {
+    fn appearance(&self, node: &Node, zoom: f32, style: &GraphStyle) -> NodeAppearance;
+}
+pub trait EdgeTypeRenderer: Send + Sync {
+    fn appearance(&self, edge: &Edge, style: &GraphStyle) -> EdgeAppearance;
+}
+
+impl<F> NodeTypeRenderer for F
+where
+    F: Fn(&Node, f32, &GraphStyle) -> NodeAppearance + Send + Sync,
+{
+    fn appearance(&self, node: &Node, zoom: f32, style: &GraphStyle) -> NodeAppearance {
+        self(node, zoom, style)
+    }
+}
+impl<F> EdgeTypeRenderer for F
+where
+    F: Fn(&Edge, &GraphStyle) -> EdgeAppearance + Send + Sync,
+{
+    fn appearance(&self, edge: &Edge, style: &GraphStyle) -> EdgeAppearance {
+        self(edge, style)
+    }
+}
+
+#[derive(Clone, Default)]
 pub struct GraphRenderer {
     style: GraphStyle,
+    node_types: Arc<HashMap<String, Arc<dyn NodeTypeRenderer>>>,
+    edge_types: Arc<HashMap<String, Arc<dyn EdgeTypeRenderer>>>,
+    diagnostics: Option<SharedDiagnosticSink>,
+    reported: Arc<Mutex<HashSet<String>>>,
+}
+
+impl fmt::Debug for GraphRenderer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GraphRenderer")
+            .field("style", &self.style)
+            .field("node_types", &self.node_types.keys())
+            .field("edge_types", &self.edge_types.keys())
+            .field("diagnostics", &self.diagnostics.is_some())
+            .finish()
+    }
 }
 
 impl GraphRenderer {
     pub fn new(style: GraphStyle) -> Self {
-        Self { style }
+        let mut renderer = Self::default();
+        renderer.set_style(style);
+        renderer
     }
     pub fn style(&self) -> &GraphStyle {
         &self.style
     }
     pub fn set_style(&mut self, style: GraphStyle) {
-        self.style = style;
+        self.style = style.sanitized();
     }
-
+    pub fn set_diagnostic_sink(&mut self, sink: Option<SharedDiagnosticSink>) {
+        self.diagnostics = sink;
+    }
+    fn report_once(&self, key: String, diagnostic: Diagnostic) {
+        let Some(sink) = &self.diagnostics else {
+            return;
+        };
+        if self
+            .reported
+            .lock()
+            .expect("diagnostic lock poisoned")
+            .insert(key)
+        {
+            sink.report(&diagnostic);
+        }
+    }
+    pub fn register_node_type(
+        &mut self,
+        name: impl Into<String>,
+        renderer: impl NodeTypeRenderer + 'static,
+    ) {
+        Arc::make_mut(&mut self.node_types).insert(name.into(), Arc::new(renderer));
+    }
+    pub fn register_edge_type(
+        &mut self,
+        name: impl Into<String>,
+        renderer: impl EdgeTypeRenderer + 'static,
+    ) {
+        Arc::make_mut(&mut self.edge_types).insert(name.into(), Arc::new(renderer));
+    }
+    pub fn node_appearance(&self, node: &Node, zoom: f32) -> NodeAppearance {
+        if !matches!(
+            node.node_type.as_str(),
+            "default" | "input" | "output" | "group"
+        ) && !self.node_types.contains_key(&node.node_type)
+        {
+            self.report_once(
+                format!("node:{}", node.node_type),
+                Diagnostic::UnknownNodeType(node.node_type.clone()),
+            );
+        }
+        let mut appearance = self
+            .node_types
+            .get(&node.node_type)
+            .or_else(|| self.node_types.get("default"))
+            .map_or(
+                NodeAppearance {
+                    color: self.style.node_color,
+                    radius_pixels: self.node_radius_pixels(zoom),
+                    shape: NodeShape::Square,
+                },
+                |renderer| renderer.appearance(node, zoom, &self.style),
+            );
+        appearance.radius_pixels = crate::style::finite_non_negative_or(
+            appearance.radius_pixels,
+            self.node_radius_pixels(zoom),
+        );
+        appearance
+    }
+    pub fn edge_appearance(&self, edge: &Edge) -> EdgeAppearance {
+        if !matches!(
+            edge.edge_type.as_str(),
+            "default" | "straight" | "bezier" | "simplebezier" | "step" | "smoothstep"
+        ) && !self.edge_types.contains_key(&edge.edge_type)
+        {
+            self.report_once(
+                format!("edge:{}", edge.edge_type),
+                Diagnostic::UnknownEdgeType(edge.edge_type.clone()),
+            );
+        }
+        let mut appearance = self
+            .edge_types
+            .get(&edge.edge_type)
+            .or_else(|| self.edge_types.get("default"))
+            .map_or(
+                EdgeAppearance {
+                    color: self.style.edge_color,
+                    width_pixels: self.style.edge_width_pixels,
+                },
+                |renderer| renderer.appearance(edge, &self.style),
+            );
+        appearance.width_pixels = crate::style::finite_non_negative_or(
+            appearance.width_pixels,
+            self.style.edge_width_pixels,
+        );
+        appearance
+    }
     pub fn interactive_edge_stride(&self, edge_count: usize, active: bool) -> usize {
         if active {
             edge_count
@@ -25,8 +207,90 @@ impl GraphRenderer {
             1
         }
     }
-
     pub fn node_radius_pixels(&self, zoom: f32) -> f32 {
-        (self.style.node_radius_world * zoom).clamp(1.0, 8.0)
+        let radius = self.style.node_radius_world * zoom;
+        if radius.is_finite() {
+            radius.clamp(1.0, 8.0)
+        } else {
+            1.0
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::WorldPoint;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[test]
+    fn unknown_type_falls_back_to_default_registry() {
+        let mut renderer = GraphRenderer::default();
+        renderer.register_node_type("default", |_: &Node, _: f32, _: &GraphStyle| {
+            NodeAppearance {
+                color: 7,
+                radius_pixels: 3.0,
+                shape: NodeShape::Diamond,
+            }
+        });
+        let node = Node::new(1u64, WorldPoint::ZERO).with_type("unknown");
+        assert_eq!(renderer.node_appearance(&node, 1.0).color, 7);
+    }
+    #[test]
+    fn unknown_type_diagnostic_is_reported_once() {
+        let reports = Arc::new(AtomicUsize::new(0));
+        let counter = reports.clone();
+        let mut renderer = GraphRenderer::default();
+        renderer.set_diagnostic_sink(Some(Arc::new(move |_: &Diagnostic| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        })));
+        let node = Node::new(1u64, WorldPoint::ZERO).with_type("missing");
+        renderer.node_appearance(&node, 1.0);
+        renderer.node_appearance(&node, 1.0);
+        assert_eq!(reports.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn sanitizes_style_and_custom_renderer_geometry() {
+        let mut renderer = GraphRenderer::new(GraphStyle {
+            node_radius_world: f32::NAN,
+            edge_width_pixels: -1.0,
+            hit_radius_pixels: f32::INFINITY,
+            ..GraphStyle::default()
+        });
+        let defaults = GraphStyle::default();
+        assert_eq!(
+            renderer.style().node_radius_world,
+            defaults.node_radius_world
+        );
+        assert_eq!(
+            renderer.style().edge_width_pixels,
+            defaults.edge_width_pixels
+        );
+        assert_eq!(
+            renderer.style().hit_radius_pixels,
+            defaults.hit_radius_pixels
+        );
+        assert_eq!(renderer.node_radius_pixels(f32::NAN), 1.0);
+
+        renderer.register_node_type("invalid", |_: &Node, _: f32, _: &GraphStyle| {
+            NodeAppearance {
+                color: 1,
+                radius_pixels: f32::INFINITY,
+                shape: NodeShape::Square,
+            }
+        });
+        renderer.register_edge_type("invalid", |_: &Edge, _: &GraphStyle| EdgeAppearance {
+            color: 1,
+            width_pixels: f32::NAN,
+        });
+        let node = Node::new(1u64, WorldPoint::ZERO).with_type("invalid");
+        let mut edge = Edge::new(1u64, 2u64);
+        edge.edge_type = "invalid".into();
+
+        assert_eq!(renderer.node_appearance(&node, 1.0).radius_pixels, 2.0);
+        assert_eq!(
+            renderer.edge_appearance(&edge).width_pixels,
+            defaults.edge_width_pixels
+        );
     }
 }
