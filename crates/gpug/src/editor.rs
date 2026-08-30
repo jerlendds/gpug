@@ -108,6 +108,150 @@ impl NodeRuntime {
     }
 }
 
+/// Sentinel for "this node has no parent" in [`NodeColumns::parent`].
+pub const NO_PARENT: u32 = u32::MAX;
+
+/// Dense, index-addressed node geometry: the graph kernel's view of the state
+/// the frame path reads.
+///
+/// [`EditorStore::runtimes`] stays the id-addressed store that the rich editor
+/// API is written against. These columns hold the same geometry one entry per
+/// node index, contiguous and numeric, because a frame touches every node in
+/// order: a layout step, a cull, and a scene rebuild each want a sequential
+/// scan, and a hash lookup per node per column turns that scan into one
+/// pointer chase per value.
+///
+/// The two representations are deliberately separate. The rich one absorbs
+/// arbitrary application data and changes shape as the editor grows; this one
+/// stays numeric so it can be scanned, chunked, vectorized, and eventually
+/// handed to the GPU unchanged.
+#[derive(Clone, Debug, Default)]
+pub struct NodeColumns {
+    /// Absolute top-left corner in world units.
+    pub x: Vec<f32>,
+    pub y: Vec<f32>,
+    /// Measured size in world units.
+    pub width: Vec<f32>,
+    pub height: Vec<f32>,
+    /// Which point inside the node its position refers to, in 0..1.
+    pub origin_x: Vec<f32>,
+    pub origin_y: Vec<f32>,
+    /// Parent node index, or [`NO_PARENT`]. An index removes the hash lookup
+    /// a layout frame would otherwise pay per node to resolve hierarchy.
+    pub parent: Vec<u32>,
+    pub hidden: Vec<bool>,
+    /// Advances on every write, so a consumer that caches something derived
+    /// from the columns can tell whether it is still current.
+    revision: u64,
+    /// Whether the graph is a forest of roots only. Computed when the columns
+    /// are rebuilt so a layout frame branches once instead of per node.
+    flat: bool,
+}
+
+impl NodeColumns {
+    pub fn len(&self) -> usize {
+        self.x.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.x.is_empty()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    #[inline]
+    pub fn touch(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// True when no node has a parent, which lets a layout frame skip
+    /// hierarchy resolution for the whole graph rather than per node.
+    pub fn is_flat(&self) -> bool {
+        self.flat
+    }
+
+    fn clear(&mut self) {
+        self.x.clear();
+        self.y.clear();
+        self.width.clear();
+        self.height.clear();
+        self.origin_x.clear();
+        self.origin_y.clear();
+        self.parent.clear();
+        self.hidden.clear();
+    }
+
+    fn push(&mut self, node: &Node, absolute: WorldPoint, size: WorldSize, parent: u32) {
+        self.x.push(absolute.x);
+        self.y.push(absolute.y);
+        self.width.push(size.width);
+        self.height.push(size.height);
+        self.origin_x.push(node.origin.x);
+        self.origin_y.push(node.origin.y);
+        self.parent.push(parent);
+        self.hidden.push(node.hidden);
+    }
+
+    /// The node's visual center in world units.
+    #[inline]
+    pub fn center(&self, index: usize) -> WorldPoint {
+        WorldPoint::new(
+            self.x[index] + self.width[index] * 0.5,
+            self.y[index] + self.height[index] * 0.5,
+        )
+    }
+
+    /// The point the node's position refers to, in world units.
+    #[inline]
+    pub fn anchor(&self, index: usize) -> WorldPoint {
+        WorldPoint::new(
+            self.x[index] + self.width[index] * self.origin_x[index],
+            self.y[index] + self.height[index] * self.origin_y[index],
+        )
+    }
+
+    #[inline]
+    pub fn size(&self, index: usize) -> WorldSize {
+        WorldSize::new(self.width[index], self.height[index])
+    }
+
+    #[inline]
+    pub fn bounds(&self, index: usize) -> WorldBounds {
+        WorldBounds::new(
+            WorldPoint::new(self.x[index], self.y[index]),
+            self.size(index),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_for_test(
+        &mut self,
+        node: &Node,
+        absolute: WorldPoint,
+        size: WorldSize,
+        parent: u32,
+    ) {
+        self.push(node, absolute, size, parent);
+        self.flat = self.parent.iter().all(|parent| *parent == NO_PARENT);
+    }
+
+    #[inline]
+    pub fn set_position(&mut self, index: usize, absolute: WorldPoint) {
+        self.x[index] = absolute.x;
+        self.y[index] = absolute.y;
+        self.touch();
+    }
+
+    #[inline]
+    pub fn set_size(&mut self, index: usize, size: WorldSize) {
+        self.width[index] = size.width;
+        self.height[index] = size.height;
+        self.touch();
+    }
+}
+
 impl EditorStore {
     fn raise_selected_node(&mut self, id: NodeId) -> bool {
         let next = self
@@ -601,6 +745,9 @@ pub struct EditorStore {
     pub connections: HashMap<NodeId, Vec<ConnectionRef>>,
     pub handle_connections: HashMap<HandleKey, Vec<ConnectionRef>>,
     pub dirty: DirtyTracker,
+    /// Dense node geometry. Written wherever a runtime is written, read by
+    /// every per-frame scan.
+    pub columns: NodeColumns,
     pub visibility: VisibilityIndex,
     pub edge_revisions: HashMap<EdgeId, u64>,
     optimistic_node_selection: HashMap<NodeId, bool>,
@@ -673,8 +820,7 @@ impl EditorStore {
             self.dirty.mark_node_spec();
         }
         self.edge_endpoints = new_endpoints;
-        self.runtimes
-            .retain(|id, _| nodes.iter().any(|n| n.id == *id));
+        self.runtimes.retain(|id, _| new_node_ids.contains(id));
         self.adopt_nodes(nodes);
         self.edge_lookup.clear();
         self.connections.clear();
@@ -735,7 +881,31 @@ impl EditorStore {
             .retain(|id, _| self.edge_lookup.contains_key(id));
         self.node_specs = nodes.iter().map(|node| (node.id, node.clone())).collect();
         self.edge_specs = edges.iter().map(|edge| (edge.id, edge.clone())).collect();
-        self.visibility.rebuild(&self.runtimes);
+        self.rebuild_columns(nodes);
+    }
+
+    /// Rebuilds the dense columns from the adopted runtimes. Called whenever
+    /// membership or any node specification changes; a frame that only moves
+    /// nodes writes the columns in place instead.
+    fn rebuild_columns(&mut self, nodes: &[Node]) {
+        self.columns.clear();
+        for node in nodes {
+            let parent = node
+                .parent_id
+                .and_then(|id| self.node_lookup.get(&id))
+                .map_or(NO_PARENT, |index| *index as u32);
+            let (absolute, size) = self.runtimes.get(&node.id).map_or_else(
+                || (node.position, node.size),
+                |runtime| (runtime.position_absolute, runtime.measured),
+            );
+            self.columns.push(node, absolute, size, parent);
+        }
+        self.columns.flat = self
+            .columns
+            .parent
+            .iter()
+            .all(|parent| *parent == NO_PARENT);
+        self.columns.touch();
     }
 
     pub fn adopt_nodes(&mut self, nodes: &[Node]) {
@@ -781,7 +951,9 @@ impl EditorStore {
         if changed {
             runtime.revision = runtime.revision.wrapping_add(1);
             self.dirty.mark_node(id);
-            self.visibility.update(id, runtime.bounds());
+            if let Some(index) = self.node_lookup.get(&id).copied() {
+                self.columns.set_size(index, size);
+            }
         }
         changed
     }
@@ -800,7 +972,9 @@ impl EditorStore {
             runtime.dragging = dragging;
             runtime.revision = runtime.revision.wrapping_add(1);
             self.dirty.mark_node(id);
-            self.visibility.update(id, runtime.bounds());
+            if let Some(index) = self.node_lookup.get(&id).copied() {
+                self.columns.set_position(index, position);
+            }
         }
         true
     }
@@ -821,12 +995,19 @@ impl EditorStore {
     /// every frame, so this marks the graph dirty once instead.
     pub fn sync_positions_from_specs(&mut self, nodes: &[Node]) -> bool {
         let mut moved = false;
-        for node in nodes {
-            let parent = node
-                .parent_id
-                .and_then(|id| self.runtimes.get(&id))
-                .map(|runtime| runtime.position_absolute)
-                .unwrap_or(WorldPoint::ZERO);
+        for (index, node) in nodes.iter().enumerate() {
+            // Parents precede their children, so the parent's absolute
+            // position is already written this pass and can be read straight
+            // out of the columns by index.
+            let parent_index = self.columns.parent.get(index).copied().unwrap_or(NO_PARENT);
+            let parent = if parent_index == NO_PARENT {
+                WorldPoint::ZERO
+            } else {
+                WorldPoint::new(
+                    self.columns.x[parent_index as usize],
+                    self.columns.y[parent_index as usize],
+                )
+            };
             let absolute = WorldPoint::new(
                 parent.x + node.position.x - node.size.width * node.origin.x,
                 parent.y + node.position.y - node.size.height * node.origin.y,
@@ -840,9 +1021,14 @@ impl EditorStore {
             runtime.position_absolute = absolute;
             runtime.dragging = false;
             runtime.revision = runtime.revision.wrapping_add(1);
-            let bounds = runtime.bounds();
-            self.visibility.update(node.id, bounds);
+            if index < self.columns.len() {
+                self.columns.x[index] = absolute.x;
+                self.columns.y[index] = absolute.y;
+            }
             moved = true;
+        }
+        if moved {
+            self.columns.touch();
         }
         if moved {
             self.dirty.mark_all();
@@ -1608,6 +1794,71 @@ impl RendererRegistry {
 mod tests {
     use super::*;
 
+    /// The dense columns are what every per-frame scan reads, so they have to
+    /// agree with the runtime map they mirror. A layout frame writes them
+    /// through parent *indices* rather than a hash map keyed by parent id;
+    /// this checks that the child still lands where the hierarchy puts it.
+    #[test]
+    fn dense_columns_mirror_the_runtimes_through_parent_indices() {
+        let parent =
+            Node::new(1u64, WorldPoint::new(100.0, 50.0)).with_size(WorldSize::new(40.0, 20.0));
+        let mut child =
+            Node::new(2u64, WorldPoint::new(5.0, 7.0)).with_size(WorldSize::new(10.0, 10.0));
+        child.parent_id = Some(NodeId(1));
+        let mut model =
+            EditorModel::new(vec![parent, child], Vec::new(), GraphOwnership::Internal).unwrap();
+
+        assert!(
+            !model.store.columns.is_flat(),
+            "a parented graph is not flat"
+        );
+        assert_eq!(model.store.columns.parent[0], NO_PARENT);
+        assert_eq!(model.store.columns.parent[1], 0);
+
+        // Move the parent the way a layout frame does, then re-derive.
+        model.nodes[0].position = WorldPoint::new(300.0, 200.0);
+        assert!(model.store.sync_positions_from_specs(&model.nodes));
+
+        for (index, node) in model.nodes.iter().enumerate() {
+            let runtime = &model.store.runtimes[&node.id];
+            assert_eq!(
+                (
+                    model.store.columns.x[index],
+                    model.store.columns.y[index],
+                    model.store.columns.size(index)
+                ),
+                (
+                    runtime.position_absolute.x,
+                    runtime.position_absolute.y,
+                    runtime.measured
+                ),
+                "column {index} drifted from its runtime"
+            );
+        }
+
+        // Parent origin (300,200) with a centered origin puts its top-left at
+        // (280,190); the child sits at that plus its own (5,7) less half its
+        // own size.
+        assert_eq!(model.store.columns.x[0], 280.0);
+        assert_eq!(model.store.columns.x[1], 280.0);
+        assert_eq!(model.store.columns.y[1], 192.0);
+    }
+
+    #[test]
+    fn a_graph_without_parents_reports_itself_flat() {
+        let model = EditorModel::new(
+            vec![
+                Node::new(1u64, WorldPoint::ZERO),
+                Node::new(2u64, WorldPoint::new(10.0, 10.0)),
+            ],
+            Vec::new(),
+            GraphOwnership::Internal,
+        )
+        .unwrap();
+        assert!(model.store.columns.is_flat());
+        assert_eq!(model.store.columns.len(), 2);
+    }
+
     #[test]
     fn external_deletion_queues_nodes_and_incident_edges_atomically() {
         let mut first = Node::new(1u64, WorldPoint::ZERO);
@@ -1897,11 +2148,11 @@ mod tests {
         );
         assert_eq!(
             store.node_position_absolute(&nodes[1]),
-            WorldPoint::new(11.0, 22.0)
+            WorldPoint::new(11.0, 18.0)
         );
         assert_eq!(
             store.node_center_absolute(&nodes[1]),
-            WorldPoint::new(11.0, 22.0)
+            WorldPoint::new(11.0, 18.0)
         );
         assert_eq!(
             store.position_relative_to_parent(&nodes[1], WorldPoint::new(20.0, 30.0)),

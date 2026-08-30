@@ -155,7 +155,7 @@ fn main() {
             |_, cx| {
                 let nodes = vec![
                     Node::new(1_u64, WorldPoint::new(25.0, 18.0))
-                        .with_size(WorldSize::new(22.0, 12.0)),
+                        .with_size(WorldSize::new(18.0, 12.0)),
                     Node::new(2_u64, WorldPoint::new(4.0, 29.0))
                         .with_size(WorldSize::new(16.0, 7.0)),
                     Node::new(3_u64, WorldPoint::new(34.0, 5.0))

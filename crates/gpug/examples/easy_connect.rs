@@ -32,8 +32,8 @@ fn example_data() -> GraphData {
         vec![
             make_node(1_u64, WorldPoint::new(0.0, 0.0), "Drop here"),
             make_node(2_u64, WorldPoint::new(30.0, 0.0), "Drop here"),
-            make_node(3_u64, WorldPoint::new(4.0, 22.0), "Drop here"),
-            make_node(4_u64, WorldPoint::new(26.0, 22.0), "Drag to connect"),
+            make_node(3_u64, WorldPoint::new(4.0, 18.0), "Drop here"),
+            make_node(4_u64, WorldPoint::new(26.0, 18.0), "Drag to connect"),
         ],
         vec![
             Edge::new(2_u64, 1_u64),

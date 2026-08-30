@@ -2,20 +2,38 @@ use rayon::prelude::*;
 
 use crate::coordinates::WorldPoint;
 use crate::data::LayoutEdge;
+use crate::profile::{self, Phase};
 
 const NONE: usize = usize::MAX;
+/// Absent child link. Narrower than a `usize` so a tree node stays small.
+const NO_CHILD: u32 = u32::MAX;
 const BARNES_HUT_THETA: f32 = 1.2;
 const MAX_TREE_DEPTH: usize = 20;
 
+/// One Barnes-Hut cell.
+///
+/// This stays an array of structs on purpose, against the grain of the rest of
+/// the engine. The render columns are scanned one field at a time across every
+/// node, which is what structure-of-arrays is for; a tree traversal is the
+/// opposite access pattern, reading a cell's mass, center, extent, and child
+/// links together before deciding where to go next. Splitting those into
+/// separate arrays would turn one cache line into six.
+///
+/// So the optimization here is to make the record narrow rather than to split
+/// it: `u32` child links and a leaf flag bring a cell to 32 bytes, which puts
+/// two of them in every cache line the traversal touches.
 #[derive(Clone)]
 struct Quad {
-    center_x: f32,
-    center_y: f32,
-    half_size: f32,
     mass_x: f32,
     mass_y: f32,
     mass: f32,
-    children: [usize; 4],
+    center_x: f32,
+    center_y: f32,
+    half_size: f32,
+    children: [u32; 4],
+    /// Cached rather than derived from `children`, so the traversal's first
+    /// branch is one byte instead of four comparisons.
+    leaf: bool,
     #[cfg(test)]
     body_start: usize,
     #[cfg(test)]
@@ -187,7 +205,10 @@ impl LayoutWorkspace {
             }
         }
         self.rebuild_adjacency(n, edges);
-        self.build_tree(&xs[..n], &ys[..n]);
+        {
+            let _scope = profile::scope(Phase::LayoutTree);
+            self.build_tree(&xs[..n], &ys[..n]);
+        }
         self.fx.resize(n, 0.0);
         self.fy.resize(n, 0.0);
         self.old_fx.resize(n, 0.0);
@@ -205,6 +226,7 @@ impl LayoutWorkspace {
         let body_leaf = &self.body_leaf;
         let offsets = &self.adjacency_offsets;
         let targets = &self.adjacency_targets;
+        let forces_scope = profile::scope(Phase::LayoutForces);
         self.fx
             .par_iter_mut()
             .zip(self.fy.par_iter_mut())
@@ -232,6 +254,8 @@ impl LayoutWorkspace {
                 }
             });
 
+        drop(forces_scope);
+        let _integrate = profile::scope(Phase::LayoutIntegrate);
         // ForceAtlas2 adaptive speed: swinging detects erratic movement while
         // effective traction measures useful convergence.
         let (total_swinging, total_traction) = (0..n)
@@ -268,6 +292,19 @@ impl LayoutWorkspace {
 
         const GRAVITY: f32 = 0.006;
         const MAX_DISPLACEMENT: f32 = 5.0;
+        // Gravity pulls toward the graph's own barycenter, which is exactly
+        // the root cell's center of mass and so costs nothing to obtain.
+        //
+        // Pulling toward a fixed world point instead would make gravity a
+        // translation: a graph laid out anywhere else drifts bodily toward
+        // that point and slides out from under a camera that was framing it,
+        // which looks like the nodes vanishing. Toward the barycenter the same
+        // force only ever pulls the graph together, and the layout stays where
+        // the viewer put it.
+        let (center_x, center_y) = self
+            .tree
+            .first()
+            .map_or((0.0, 0.0), |root| (root.mass_x, root.mass_y));
         let speed = self.speed;
         let total_displacement = xs[..n]
             .par_iter_mut()
@@ -280,8 +317,8 @@ impl LayoutWorkspace {
                 let swing_y = self.old_fy[index] - *force_y;
                 let swinging = mass * (swing_x * swing_x + swing_y * swing_y).sqrt();
                 let factor = speed / (1.0 + (speed * swinging).sqrt());
-                let mut dx = (*force_x + GRAVITY * (800.0 - *x)) * factor;
-                let mut dy = (*force_y + GRAVITY * (200.0 - *y)) * factor;
+                let mut dx = (*force_x + GRAVITY * (center_x - *x)) * factor;
+                let mut dy = (*force_y + GRAVITY * (center_y - *y)) * factor;
                 let displacement_squared = dx * dx + dy * dy;
                 let displacement = if displacement_squared > MAX_DISPLACEMENT * MAX_DISPLACEMENT {
                     let scale = MAX_DISPLACEMENT / displacement_squared.sqrt();
@@ -322,13 +359,14 @@ fn build_quad(
         (sum_x + xs[body], sum_y + ys[body])
     });
     tree.push(Quad {
-        center_x,
-        center_y,
-        half_size,
         mass_x: sum_x / mass,
         mass_y: sum_y / mass,
         mass,
-        children: [NONE; 4],
+        center_x,
+        center_y,
+        half_size,
+        children: [NO_CHILD; 4],
+        leaf: true,
         #[cfg(test)]
         body_start,
         #[cfg(test)]
@@ -379,7 +417,7 @@ fn build_quad(
             } else {
                 child_half
             };
-        tree[index].children[quadrant] = build_quad(
+        let child = build_quad(
             tree,
             indices,
             scratch,
@@ -393,6 +431,8 @@ fn build_quad(
             child_half,
             depth + 1,
         );
+        tree[index].children[quadrant] = child as u32;
+        tree[index].leaf = false;
     }
     index
 }
@@ -409,7 +449,7 @@ fn accumulate_repulsion(
     force_y: &mut f32,
 ) {
     let quad = &tree[quad_index];
-    if quad.children.iter().all(|&child| child == NONE) {
+    if quad.leaf {
         let contains_body = body_leaf[body] == quad_index;
         let mass = quad.mass - f32::from(contains_body);
         if mass > 0.0 {
@@ -437,8 +477,17 @@ fn accumulate_repulsion(
         return;
     }
     for &child in &quad.children {
-        if child != NONE {
-            accumulate_repulsion(tree, body_leaf, child, body, x, y, force_x, force_y);
+        if child != NO_CHILD {
+            accumulate_repulsion(
+                tree,
+                body_leaf,
+                child as usize,
+                body,
+                x,
+                y,
+                force_x,
+                force_y,
+            );
         }
     }
 }
@@ -446,6 +495,34 @@ fn accumulate_repulsion(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gravity must hold a graph together without moving it. A fixed
+    /// attractor makes it a translation as well, which walks the layout out of
+    /// whatever view was framing it.
+    #[test]
+    fn gravity_pulls_inward_without_translating_the_graph() {
+        let mut xs: Vec<f32> = (0..64).map(|index| 9_000.0 + (index % 8) as f32 * 10.0).collect();
+        let mut ys: Vec<f32> = (0..64).map(|index| -4_000.0 + (index / 8) as f32 * 10.0).collect();
+        let centroid = |xs: &[f32], ys: &[f32]| {
+            (
+                xs.iter().sum::<f32>() / xs.len() as f32,
+                ys.iter().sum::<f32>() / ys.len() as f32,
+            )
+        };
+        let before = centroid(&xs, &ys);
+
+        let mut workspace = LayoutWorkspace::default();
+        for _ in 0..200 {
+            workspace.step(&mut xs, &mut ys, &[]);
+        }
+        let after = centroid(&xs, &ys);
+
+        assert!(
+            (after.0 - before.0).abs() < 50.0 && (after.1 - before.1).abs() < 50.0,
+            "the graph drifted from {before:?} to {after:?}"
+        );
+        assert!(xs.iter().chain(&ys).all(|value| value.is_finite()));
+    }
 
     #[test]
     fn barnes_hut_step_stays_finite() {

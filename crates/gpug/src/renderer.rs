@@ -38,12 +38,25 @@ impl EdgePaintContext<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NodeShape {
-    /// No canvas primitive. Used when registered node content paints the shell.
+    /// No canvas primitive. Used when registered node content paints the shell
+    /// at every zoom level. Prefer `Rect` for content nodes so the graph has a
+    /// cheap representation to fall back to when the node is small on screen.
     None,
     Square,
     Diamond,
+    /// The node body as a rounded rectangle spanning its world size.
+    ///
+    /// This is the level-of-detail proxy for a node that also registers
+    /// element content: it paints as a single instanced quad whose corners and
+    /// border are evaluated analytically in the fragment shader, so a screen
+    /// full of them costs one batch rather than one element tree each.
+    Rect {
+        corner_radius_world: f32,
+        border_color: u32,
+        border_width_pixels: f32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

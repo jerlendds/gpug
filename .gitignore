@@ -4,3 +4,4 @@ artifacts/
 # shhhhhh....
 crates/secret-project/
 test-loop.sh
+website/

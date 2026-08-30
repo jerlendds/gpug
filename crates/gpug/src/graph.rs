@@ -20,6 +20,7 @@ use crate::layout::{
     LayoutOptions, LayoutStatus,
 };
 use crate::node::{Node, NodeId};
+use crate::profile::{self, Counter, Phase};
 use crate::renderer::GraphRenderer;
 use crate::renderer::{EdgeAppearance, NodeAppearance, NodeShape};
 use crate::style::GraphStyle;
@@ -73,6 +74,10 @@ impl Render for NodeContentLayer {
 const CONNECTION_HANDLE_SIZE_WORLD: f32 = 0.7;
 const CONNECTION_HANDLE_GAP_WORLD: f32 = 0.5;
 const RECONNECT_HANDLE_SIZE_WORLD: f32 = 0.9;
+/// On-screen node height, in pixels, below which a rounded body degrades to a
+/// flat fill. Corner rounding and a one-pixel border are both sub-pixel below
+/// this, so the shaped quad costs shader work that resolves to nothing.
+const SHELL_LOD_MIN_PIXELS: f32 = 5.0;
 
 /// Edge type resolved once per membership change. Comparing a copyable tag per
 /// frame beats re-reading and re-hashing every edge's type string.
@@ -118,15 +123,30 @@ struct SceneCache {
     node_ids: Rc<[NodeId]>,
     node_sizes: Rc<[crate::WorldSize]>,
     edge_kinds: Rc<[EdgeKind]>,
+    /// Whether any edge needs sampled geometry, and whether any carries a
+    /// label. Both let a frame skip a full pass over the edge list rather than
+    /// walking it to discover there was nothing to do.
+    any_curved_edges: bool,
+    any_edge_labels: bool,
     edge_ids: Rc<[crate::EdgeId]>,
     edge_markers: Rc<[(bool, bool)]>,
     edge_appearances: Rc<[EdgeAppearance]>,
-    positions: Rc<[WorldPoint]>,
-    edge_geometries: Rc<[Option<Vec<WorldPoint>>]>,
+    /// Rebuilt on every frame that moves a node, so these are the two buffers
+    /// that must never reallocate. `Rc::make_mut` writes in place while the
+    /// previous frame's paint closure has been dropped, and copies only if it
+    /// has not - which is the adaptive form of double buffering.
+    positions: Rc<Vec<WorldPoint>>,
+    edge_geometries: Rc<Vec<Option<Vec<WorldPoint>>>>,
     node_appearances: Rc<[NodeAppearance]>,
     selected: Rc<[usize]>,
     node_order: Rc<[usize]>,
-    selected_edges: Rc<[(crate::EdgeId, LayoutEdge)]>,
+    /// Edge index alongside its endpoints, so the selection pass indexes the
+    /// scene columns directly instead of searching the id column per edge.
+    selected_edges: Rc<[(usize, LayoutEdge)]>,
+    resize_directions: Rc<[Option<Rc<[crate::ResizeDirection]>>]>,
+    show_resize_controls: Rc<[bool]>,
+    resize_controls_always_visible: Rc<[bool]>,
+    resize_control_colors: Rc<[Option<u32>]>,
 }
 
 fn reconnecting_edge_id(state: &ConnectionState) -> Option<crate::EdgeId> {
@@ -326,7 +346,10 @@ impl Default for GraphBuilder {
             target_handle_position: Position::Left,
             source_handle_position: Position::Right,
             show_resize_handles: false,
-            only_render_visible_elements: false,
+            // Culling is a pure win: the visible set is a conservative
+            // superset of what the camera can show, so a graph looks the same
+            // with it on and stops paying for what is off screen.
+            only_render_visible_elements: true,
             selection_mode: SelectionMode::Partial,
             snap_grid: None,
             ownership: GraphOwnership::Internal,
@@ -471,6 +494,9 @@ pub struct Graph {
     layout: Box<dyn Layout>,
     layout_options: LayoutOptions,
     layout_positions: Vec<WorldPoint>,
+    /// Scratch column for hierarchical write-back, retained so a layout frame
+    /// allocates nothing.
+    layout_origins: Vec<WorldPoint>,
     layout_initialized: bool,
     playing: bool,
     sim_tick: u64,
@@ -498,7 +524,28 @@ pub struct Graph {
     selection_mode: SelectionMode,
     snap_grid: Option<crate::WorldSize>,
     edge_geometry_cache: crate::GeometryCache<Vec<WorldPoint>>,
+    /// Closed-loop edge level of detail, and the clock it is driven from.
+    governor: crate::DetailGovernor,
+    last_frame: Option<std::time::Instant>,
+    /// Duration of the previous frame and of the layout work inside it. The
+    /// difference is the fixed cost a frame owes to everything that is not
+    /// simulation, which is what the layout's slice of the deadline is
+    /// computed against.
+    last_frame_ms: f32,
+    last_layout_ms: f32,
     scene: SceneCache,
+    /// Dense cull output, retained across frames so a frame allocates nothing
+    /// to answer "what is on screen". `visible_flags` is indexed by node index
+    /// and lets an edge test both endpoints with two array reads.
+    visible_indices: Rc<Vec<u32>>,
+    visible_flags: Rc<Vec<bool>>,
+    /// Node indices that have a registered element content renderer. Derived
+    /// from node specs, so it is rebuilt only when the specs change.
+    content_present: Rc<Vec<bool>>,
+    /// Node indices that actually received an element this frame. The painter
+    /// reads it to substitute a drawn body for every node the level-of-detail
+    /// rule or the frame budget turned away.
+    content_drawn: Rc<Vec<bool>>,
     pointer: Option<PointerController>,
     synced_membership_revision: u64,
     style_revision: u64,
@@ -557,6 +604,7 @@ impl Graph {
             layout: builder.layout,
             layout_options: builder.layout_options,
             layout_positions: Vec::new(),
+            layout_origins: Vec::new(),
             layout_initialized: false,
             playing: builder.interactive_layout,
             sim_tick: 0,
@@ -584,7 +632,15 @@ impl Graph {
             selection_mode: builder.selection_mode,
             snap_grid: builder.snap_grid,
             edge_geometry_cache: crate::GeometryCache::default(),
+            governor: crate::DetailGovernor::default(),
+            last_frame: None,
+            last_frame_ms: 0.0,
+            last_layout_ms: 0.0,
             scene: SceneCache::default(),
+            visible_indices: Rc::default(),
+            visible_flags: Rc::default(),
+            content_present: Rc::default(),
+            content_drawn: Rc::default(),
             pointer: None,
             synced_membership_revision,
             style_revision: 0,
@@ -1039,6 +1095,13 @@ impl Graph {
         self.events.push(GraphEvent::ViewportChanged(self.viewport));
         self.model.store.dirty.mark_viewport();
     }
+    /// World-space bounds of every visible node, or `None` when the graph is
+    /// empty. This is what `fit_to_view` fits, exposed so a caller can drive
+    /// the camera itself without reaching into the store.
+    pub fn content_bounds(&self) -> Option<WorldBounds> {
+        world_bounds(&self.model.nodes, &self.model.store)
+    }
+
     pub fn set_center(&mut self, world: WorldPoint, screen_size: Size<Pixels>, zoom: f32) {
         self.viewport.set_center(
             world,
@@ -1072,43 +1135,62 @@ impl Graph {
     }
 
     fn node_at_screen_position(&self, position: Point<Pixels>) -> Option<usize> {
-        let hit_radius = px(self.renderer.style().hit_radius_pixels);
+        let _scope = profile::scope(Phase::Pick);
+        let zoom = self.viewport.zoom().max(f32::MIN_POSITIVE);
+        let hit_radius = self.renderer.style().hit_radius_pixels;
+        let world = self.viewport.screen_to_world(position);
+        // The pointer's hit region in world units. Nodes without content are
+        // hit within a fixed pixel radius; nodes with content are hit within
+        // their own body, which can be larger, so the query is widened by the
+        // radius and each candidate is then tested exactly.
+        let margin = hit_radius / zoom;
+        let query = WorldBounds::new(
+            WorldPoint::new(world.x - margin, world.y - margin),
+            crate::WorldSize::new(margin * 2.0, margin * 2.0),
+        );
+        let mut candidates = Vec::new();
         self.model
-            .nodes
-            .iter()
-            .enumerate()
-            .filter_map(|(index, node)| {
-                if node.hidden {
-                    return None;
-                }
-                let center = self.viewport.world_to_screen(self.node_center(node));
-                let (half_width, half_height) = if self.renderer.has_node_content(node) {
-                    let measured = self
-                        .model
-                        .store
-                        .runtimes
-                        .get(&node.id)
-                        .map_or(node.size, |runtime| runtime.measured);
-                    (
-                        px(measured.width * self.viewport.zoom() * 0.5),
-                        px(measured.height * self.viewport.zoom() * 0.5),
-                    )
-                } else {
-                    (hit_radius, hit_radius)
-                };
-                let hit = (center.x - position.x).abs() <= half_width
-                    && (center.y - position.y).abs() <= half_height;
-                hit.then_some((
-                    self.model
-                        .store
-                        .runtimes
-                        .get(&node.id)
-                        .map_or(0, |runtime| runtime.z),
-                    index,
-                ))
-            })
-            .max()
-            .map(|(_, index)| index)
+            .store
+            .visibility
+            .query(&self.model.store.columns, query, &mut candidates);
+
+        let columns = &self.model.store.columns;
+        let mut best: Option<(i32, usize)> = None;
+        for index in candidates.into_iter().map(|index| index as usize) {
+            let node = &self.model.nodes[index];
+            if node.hidden {
+                continue;
+            }
+            let center = self.viewport.world_to_screen(columns.center(index));
+            let (half_width, half_height) = if self
+                .content_present
+                .get(index)
+                .copied()
+                .unwrap_or_else(|| self.renderer.has_node_content(node))
+            {
+                (
+                    px(columns.width[index] * zoom * 0.5),
+                    px(columns.height[index] * zoom * 0.5),
+                )
+            } else {
+                (px(hit_radius), px(hit_radius))
+            };
+            if (center.x - position.x).abs() > half_width
+                || (center.y - position.y).abs() > half_height
+            {
+                continue;
+            }
+            let z = self
+                .model
+                .store
+                .runtimes
+                .get(&node.id)
+                .map_or(0, |runtime| runtime.z);
+            if best.is_none_or(|current| (z, index) > current) {
+                best = Some((z, index));
+            }
+        }
+        best.map(|(_, index)| index)
     }
 
     fn node_allows_drag_at_screen_position(&self, node: &Node, position: Point<Pixels>) -> bool {
@@ -1306,12 +1388,68 @@ impl Graph {
     }
 
     fn edge_index_at_screen_position(&self, position: Point<Pixels>) -> Option<usize> {
+        let _scope = profile::scope(Phase::Pick);
         let point_x = position.x / px(1.0);
         let point_y = position.y / px(1.0);
+
         // Hit testing can run between a structural edit and the next render,
-        // before `sync` has rebuilt `layout_edges`. Use the live edge list and
-        // stable endpoint IDs so deleting an edge cannot leave parallel arrays
-        // with mismatched lengths or ordering here.
+        // before `sync` has rebuilt `layout_edges`. When the two agree, an
+        // edge's endpoints are node indices and cost two column reads; when
+        // they do not, fall back to resolving endpoints by id so a deletion
+        // cannot leave this walking mismatched parallel arrays.
+        let indexed = self.synced_membership_revision
+            == self.model.store.dirty.revisions.membership
+            && self.layout_edges.len() == self.model.edges.len()
+            && self.model.store.columns.len() == self.model.nodes.len();
+
+        let nearest = |start: Point<Pixels>, end: Point<Pixels>, tolerance: f32| {
+            let start_x = start.x / px(1.0);
+            let start_y = start.y / px(1.0);
+            let end_x = end.x / px(1.0);
+            let end_y = end.y / px(1.0);
+            // Reject against the segment's bounding box first. Most edges are
+            // nowhere near the pointer, and a rectangle test rejects them
+            // without the projection, the divide, or the two squares.
+            if point_x < start_x.min(end_x) - tolerance
+                || point_x > start_x.max(end_x) + tolerance
+                || point_y < start_y.min(end_y) - tolerance
+                || point_y > start_y.max(end_y) + tolerance
+            {
+                return false;
+            }
+            let dx = end_x - start_x;
+            let dy = end_y - start_y;
+            let length_squared = dx * dx + dy * dy;
+            let t = if length_squared > 0.0 {
+                (((point_x - start_x) * dx + (point_y - start_y) * dy) / length_squared)
+                    .clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let nearest_x = start_x + t * dx;
+            let nearest_y = start_y + t * dy;
+            (point_x - nearest_x).powi(2) + (point_y - nearest_y).powi(2) <= tolerance * tolerance
+        };
+
+        if indexed {
+            let columns = &self.model.store.columns;
+            for (edge_index, (edge, layout)) in self
+                .model
+                .edges
+                .iter()
+                .zip(self.layout_edges.iter())
+                .enumerate()
+            {
+                let tolerance = edge.interaction_width_for_hit_testing() * 0.5;
+                let start = self.viewport.world_to_screen(columns.center(layout.source));
+                let end = self.viewport.world_to_screen(columns.center(layout.target));
+                if nearest(start, end, tolerance) {
+                    return Some(edge_index);
+                }
+            }
+            return None;
+        }
+
         self.model
             .edges
             .iter()
@@ -1320,24 +1458,9 @@ impl Graph {
                 let source = self.model.node(edge.source)?;
                 let target = self.model.node(edge.target)?;
                 let tolerance = edge.interaction_width_for_hit_testing() * 0.5;
-                let tolerance_squared = tolerance.powi(2);
                 let start = self.viewport.world_to_screen(self.node_center(source));
                 let end = self.viewport.world_to_screen(self.node_center(target));
-                let start_x = start.x / px(1.0);
-                let start_y = start.y / px(1.0);
-                let dx = end.x / px(1.0) - start_x;
-                let dy = end.y / px(1.0) - start_y;
-                let length_squared = dx * dx + dy * dy;
-                let t = if length_squared > 0.0 {
-                    (((point_x - start_x) * dx + (point_y - start_y) * dy) / length_squared)
-                        .clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                let nearest_x = start_x + t * dx;
-                let nearest_y = start_y + t * dy;
-                ((point_x - nearest_x).powi(2) + (point_y - nearest_y).powi(2) <= tolerance_squared)
-                    .then_some(edge_index)
+                nearest(start, end, tolerance).then_some(edge_index)
             })
     }
 
@@ -1475,20 +1598,13 @@ impl Graph {
         let membership = revisions.membership;
         let specs = (membership, revisions.node_specs, revisions.edge_specs);
         if self.scene.specs != Some(specs) {
+            let _scope = profile::scope(Phase::SceneSpecs);
             self.scene.specs = Some(specs);
             self.scene.hidden = self.model.nodes.iter().map(|node| node.hidden).collect();
             self.scene.node_ids = self.model.nodes.iter().map(|node| node.id).collect();
-            self.scene.node_sizes = self
-                .model
-                .nodes
-                .iter()
-                .map(|node| {
-                    self.model
-                        .store
-                        .runtimes
-                        .get(&node.id)
-                        .map_or(node.size, |runtime| runtime.measured)
-                })
+            let columns = &self.model.store.columns;
+            self.scene.node_sizes = (0..columns.len())
+                .map(|index| columns.size(index))
                 .collect();
             self.scene.edge_kinds = self
                 .model
@@ -1496,6 +1612,12 @@ impl Graph {
                 .iter()
                 .map(|edge| EdgeKind::from_type(&edge.edge_type))
                 .collect();
+            self.scene.any_curved_edges = self
+                .scene
+                .edge_kinds
+                .iter()
+                .any(|kind| *kind != EdgeKind::Straight);
+            self.scene.any_edge_labels = self.model.edges.iter().any(|edge| edge.label.is_some());
             self.scene.edge_ids = self.model.edges.iter().map(|edge| edge.id).collect();
             self.scene.edge_markers = self
                 .model
@@ -1503,91 +1625,147 @@ impl Graph {
                 .iter()
                 .map(|edge| (edge.marker_start.is_some(), edge.marker_end.is_some()))
                 .collect();
+            // Resize configuration is part of a node's specification, so it
+            // belongs with the other spec-derived columns. Rebuilt here, these
+            // are four `Rc` clones per frame instead of four fresh vectors.
+            self.scene.resize_directions = self
+                .model
+                .nodes
+                .iter()
+                .map(|node| {
+                    node.resize_directions
+                        .as_deref()
+                        .map(|directions| Rc::from(directions))
+                })
+                .collect();
+            self.scene.show_resize_controls = self
+                .model
+                .nodes
+                .iter()
+                .map(|node| node.show_resize_controls)
+                .collect();
+            self.scene.resize_controls_always_visible = self
+                .model
+                .nodes
+                .iter()
+                .map(|node| node.resize_controls_always_visible)
+                .collect();
+            self.scene.resize_control_colors = self
+                .model
+                .nodes
+                .iter()
+                .map(|node| node.resize_control_color)
+                .collect();
+            let mut present = std::mem::take(&mut self.content_present);
+            let slot = Rc::make_mut(&mut present);
+            slot.clear();
+            slot.extend(
+                self.model
+                    .nodes
+                    .iter()
+                    .map(|node| renderer.has_node_content(node)),
+            );
+            self.content_present = present;
         }
 
         let motion = (membership, revisions.nodes, revisions.edges);
         if self.scene.motion != Some(motion) {
+            let _scope = profile::scope(Phase::SceneMotion);
             self.scene.motion = Some(motion);
-            self.scene.positions = self
-                .model
-                .nodes
-                .iter()
-                .map(|node| self.model.store.node_center_absolute(node))
-                .collect();
+            let mut positions_buffer = std::mem::take(&mut self.scene.positions);
+            {
+                let slot = Rc::make_mut(&mut positions_buffer);
+                slot.clear();
+                let columns = &self.model.store.columns;
+                slot.extend((0..columns.len()).map(|index| columns.center(index)));
+            }
+            self.scene.positions = positions_buffer;
             let positions = self.scene.positions.clone();
             let kinds = self.scene.edge_kinds.clone();
             let mut cache = std::mem::take(&mut self.edge_geometry_cache);
-            let mut geometries = Vec::with_capacity(self.model.edges.len());
-            for (index, (edge, layout)) in self
-                .model
-                .edges
-                .iter()
-                .zip(self.layout_edges.iter())
-                .enumerate()
-            {
-                let kind = kinds.get(index).copied().unwrap_or(EdgeKind::Straight);
-                if kind == EdgeKind::Straight {
-                    geometries.push(None);
-                    continue;
-                }
-                let stamp = (
-                    *self.model.store.edge_revisions.get(&edge.id).unwrap_or(&0),
-                    self.model
-                        .store
-                        .runtimes
-                        .get(&edge.source)
-                        .map_or(0, |runtime| runtime.revision),
-                    self.model
-                        .store
-                        .runtimes
-                        .get(&edge.target)
-                        .map_or(0, |runtime| runtime.revision),
-                );
-                let a = positions[layout.source];
-                let b = positions[layout.target];
-                geometries.push(Some(cache.get_or_insert_with(edge.id, stamp, || {
-                    match kind {
-                        EdgeKind::Bezier => {
-                            let (curve, _) = crate::connection::bezier_path(
-                                a,
-                                self.source_handle_position,
-                                b,
-                                self.target_handle_position,
-                                0.25,
-                            );
-                            (0..=12)
-                                .map(|index| {
-                                    let t = index as f32 / 12.0;
-                                    let u = 1.0 - t;
-                                    WorldPoint::new(
-                                        u * u * u * curve[0].x
-                                            + 3.0 * u * u * t * curve[1].x
-                                            + 3.0 * u * t * t * curve[2].x
-                                            + t * t * t * curve[3].x,
-                                        u * u * u * curve[0].y
-                                            + 3.0 * u * u * t * curve[1].y
-                                            + 3.0 * u * t * t * curve[2].y
-                                            + t * t * t * curve[3].y,
-                                    )
-                                })
-                                .collect()
-                        }
-                        EdgeKind::SmoothStep => {
-                            crate::connection::smooth_step_path(
-                                a,
-                                self.source_handle_position,
-                                b,
-                                self.target_handle_position,
-                                20.0,
-                            )
-                            .0
-                        }
-                        EdgeKind::Straight | EdgeKind::Custom => vec![a, b],
+            let mut geometry_buffer = std::mem::take(&mut self.scene.edge_geometries);
+            let geometries = Rc::make_mut(&mut geometry_buffer);
+            geometries.clear();
+            // A graph of straight edges needs no sampled geometry at all. An
+            // empty column means "every edge is its two endpoints", which the
+            // paint passes already fall back to, so this skips a pass over
+            // every edge on every frame that moves a node.
+            if !self.scene.any_curved_edges {
+                self.scene.edge_geometries = geometry_buffer;
+                self.edge_geometry_cache = cache;
+            } else {
+                geometries.reserve(self.model.edges.len());
+                for (index, (edge, layout)) in self
+                    .model
+                    .edges
+                    .iter()
+                    .zip(self.layout_edges.iter())
+                    .enumerate()
+                {
+                    let kind = kinds.get(index).copied().unwrap_or(EdgeKind::Straight);
+                    if kind == EdgeKind::Straight {
+                        geometries.push(None);
+                        continue;
                     }
-                })));
+                    let stamp = (
+                        *self.model.store.edge_revisions.get(&edge.id).unwrap_or(&0),
+                        self.model
+                            .store
+                            .runtimes
+                            .get(&edge.source)
+                            .map_or(0, |runtime| runtime.revision),
+                        self.model
+                            .store
+                            .runtimes
+                            .get(&edge.target)
+                            .map_or(0, |runtime| runtime.revision),
+                    );
+                    let a = positions[layout.source];
+                    let b = positions[layout.target];
+                    geometries.push(Some(cache.get_or_insert_with(edge.id, stamp, || {
+                        match kind {
+                            EdgeKind::Bezier => {
+                                let (curve, _) = crate::connection::bezier_path(
+                                    a,
+                                    self.source_handle_position,
+                                    b,
+                                    self.target_handle_position,
+                                    0.25,
+                                );
+                                (0..=12)
+                                    .map(|index| {
+                                        let t = index as f32 / 12.0;
+                                        let u = 1.0 - t;
+                                        WorldPoint::new(
+                                            u * u * u * curve[0].x
+                                                + 3.0 * u * u * t * curve[1].x
+                                                + 3.0 * u * t * t * curve[2].x
+                                                + t * t * t * curve[3].x,
+                                            u * u * u * curve[0].y
+                                                + 3.0 * u * u * t * curve[1].y
+                                                + 3.0 * u * t * t * curve[2].y
+                                                + t * t * t * curve[3].y,
+                                        )
+                                    })
+                                    .collect()
+                            }
+                            EdgeKind::SmoothStep => {
+                                crate::connection::smooth_step_path(
+                                    a,
+                                    self.source_handle_position,
+                                    b,
+                                    self.target_handle_position,
+                                    20.0,
+                                )
+                                .0
+                            }
+                            EdgeKind::Straight | EdgeKind::Custom => vec![a, b],
+                        }
+                    })));
+                }
+                self.edge_geometry_cache = cache;
+                self.scene.edge_geometries = geometry_buffer;
             }
-            self.edge_geometry_cache = cache;
-            self.scene.edge_geometries = geometries.into();
         }
 
         // Custom renderers are handed the whole node or edge, selection flag
@@ -1602,6 +1780,7 @@ impl Graph {
             zoom_bits: zoom.to_bits(),
         };
         if self.scene.appearance != Some(appearance) {
+            let _scope = profile::scope(Phase::SceneAppearance);
             self.scene.appearance = Some(appearance);
             self.scene.node_appearances = self
                 .model
@@ -1619,6 +1798,7 @@ impl Graph {
 
         let selection = (membership, revisions.selection);
         if self.scene.selection != Some(selection) {
+            let _scope = profile::scope(Phase::SceneSelection);
             self.scene.selection = Some(selection);
             self.scene.selected = self
                 .model
@@ -1645,35 +1825,65 @@ impl Graph {
                 .edges
                 .iter()
                 .zip(self.layout_edges.iter())
-                .filter_map(|(edge, layout)| {
+                .enumerate()
+                .filter_map(|(index, (edge, layout))| {
                     self.model
                         .store
                         .edge_selected(edge)
-                        .then_some((edge.id, *layout))
+                        .then_some((index, *layout))
                 })
                 .collect();
         }
     }
 
+    /// How long this frame's simulation may run.
+    ///
+    /// A force-directed layout is an anytime algorithm: more steps converge
+    /// faster, and stopping early costs smoothness rather than correctness.
+    /// That makes it exactly the work that should absorb whatever the frame
+    /// deadline has left over once drawing has been paid for, instead of
+    /// taking a fixed slice that is too small on an idle frame and too large
+    /// on a busy one.
+    ///
+    /// The configured budget stays the ceiling, so this only ever gives the
+    /// simulation less than the application asked for, never more.
+    fn layout_slice(&self) -> std::time::Duration {
+        let configured = self.layout_options.frame_budget;
+        let Some(target_ms) = self.renderer.style().frame_budget_ms else {
+            return configured;
+        };
+        if self.last_frame_ms <= 0.0 {
+            return configured;
+        }
+        let ceiling_ms = configured.as_secs_f32() * 1_000.0;
+        let overhead_ms = (self.last_frame_ms - self.last_layout_ms).max(0.0);
+        let slack_ms = (target_ms - overhead_ms).clamp(0.5, ceiling_ms);
+        std::time::Duration::from_secs_f32(slack_ms / 1_000.0)
+    }
+
     pub fn step_layout(&mut self) -> LayoutStatus {
+        let _scope = profile::scope(Phase::Layout);
+        let count = self.model.store.columns.len();
         self.layout_positions.clear();
-        self.layout_positions.extend(
-            self.model
-                .nodes
-                .iter()
-                .map(|node| self.model.store.node_position_absolute(node)),
-        );
+        self.layout_positions.reserve(count);
+        {
+            let columns = &self.model.store.columns;
+            self.layout_positions
+                .extend((0..count).map(|index| columns.anchor(index)));
+        }
         if !self.layout_initialized {
             self.layout
                 .initialize(&self.layout_positions, &self.layout_edges);
             self.layout_initialized = true;
         }
+        let started = std::time::Instant::now();
+        let slice = self.layout_slice();
         let status = if self.layout.use_frame_budget() {
             step_with_budget(
                 self.layout.as_mut(),
                 &mut self.layout_positions,
                 &self.layout_edges,
-                self.layout_options.frame_budget,
+                slice,
             )
         } else {
             self.layout
@@ -1686,40 +1896,46 @@ impl Graph {
         if matches!(&status, LayoutStatus::Converged) {
             apply_fit(&mut self.layout_positions, self.layout_options.fit);
         }
-        // Parents precede their children (enforced by graph validation). Keep
-        // the simulation global, then serialize each result in its parent's
-        // freshly computed coordinate system.
-        let mut origins = std::collections::HashMap::new();
-        let measured = self
-            .model
-            .nodes
-            .iter()
-            .map(|node| self.model.store.runtimes[&node.id].measured)
-            .collect::<Vec<_>>();
-        for ((node, absolute), size) in self
-            .model
-            .nodes
-            .iter_mut()
-            .zip(&self.layout_positions)
-            .zip(measured)
-        {
-            let parent_origin = node
-                .parent_id
-                .and_then(|id| origins.get(&id).copied())
-                .unwrap_or(WorldPoint::ZERO);
-            node.position =
-                WorldPoint::new(absolute.x - parent_origin.x, absolute.y - parent_origin.y);
-            origins.insert(
-                node.id,
-                WorldPoint::new(
-                    absolute.x - size.width * node.origin.x,
-                    absolute.y - size.height * node.origin.y,
-                ),
-            );
+        if self.model.store.columns.is_flat() {
+            // No hierarchy: an absolute position is the position. This is the
+            // overwhelmingly common shape, and taking it as one branch for the
+            // whole graph keeps the write-back a single sequential pass.
+            for (node, absolute) in self.model.nodes.iter_mut().zip(&self.layout_positions) {
+                node.position = *absolute;
+            }
+        } else {
+            // Parents precede their children (enforced by graph validation),
+            // so each parent's freshly computed origin is already in the
+            // scratch column when its children read it - by index, not by a
+            // hash lookup, and into storage that is reused every frame.
+            self.layout_origins.clear();
+            self.layout_origins.resize(count, WorldPoint::ZERO);
+            let columns = &self.model.store.columns;
+            for (index, (node, absolute)) in self
+                .model
+                .nodes
+                .iter_mut()
+                .zip(&self.layout_positions)
+                .enumerate()
+            {
+                let parent = columns.parent[index];
+                let parent_origin = if parent == crate::editor::NO_PARENT {
+                    WorldPoint::ZERO
+                } else {
+                    self.layout_origins[parent as usize]
+                };
+                node.position =
+                    WorldPoint::new(absolute.x - parent_origin.x, absolute.y - parent_origin.y);
+                self.layout_origins[index] = WorldPoint::new(
+                    absolute.x - columns.width[index] * node.origin.x,
+                    absolute.y - columns.height[index] * node.origin.y,
+                );
+            }
         }
         self.model
             .store
             .sync_positions_from_specs(&self.model.nodes);
+        self.last_layout_ms = started.elapsed().as_secs_f32() * 1_000.0;
         self.sim_tick = self.sim_tick.wrapping_add(1);
         if status.is_finished() {
             self.playing = false;
@@ -1754,6 +1970,50 @@ const RESIZE_DIRECTIONS: [crate::ResizeDirection; 8] = [
     crate::ResizeDirection::SouthWest,
     crate::ResizeDirection::West,
 ];
+
+/// Selects the nodes that render element content this frame.
+///
+/// Two things bound the selection. A node must be large enough on screen for
+/// element-level detail to be legible at all, and only so many nodes may be
+/// promoted in one frame however far the viewer has zoomed in. Nodes are
+/// considered front to back so that when the budget binds it is the ones
+/// furthest behind that fall back to a drawn body - the viewer's attention is
+/// on what is in front.
+///
+/// `drawn` is overwritten with one flag per node index. Nodes it turns away
+/// are not skipped: the paint pass reads the same flags and draws their bodies
+/// from the scene columns instead.
+#[allow(clippy::too_many_arguments)]
+fn select_content_lod(
+    order: &[usize],
+    hidden: &[bool],
+    present: &[bool],
+    visible: Option<&[bool]>,
+    sizes: &[crate::WorldSize],
+    zoom: f32,
+    min_pixels: f32,
+    budget: usize,
+    drawn: &mut Vec<bool>,
+) {
+    drawn.clear();
+    drawn.resize(present.len(), false);
+    let mut remaining = budget;
+    for index in order.iter().rev().copied() {
+        if remaining == 0 {
+            break;
+        }
+        if index >= present.len()
+            || hidden[index]
+            || !present[index]
+            || visible.is_some_and(|visible| !visible[index])
+            || sizes[index].height * zoom < min_pixels
+        {
+            continue;
+        }
+        drawn[index] = true;
+        remaining -= 1;
+    }
+}
 
 fn resize_handle_position(
     center: Point<Pixels>,
@@ -1831,6 +2091,7 @@ fn world_bounds(nodes: &[Node], store: &EditorStore) -> Option<WorldBounds> {
 
 impl Render for Graph {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _frame = profile::scope(Phase::Render);
         let data_updates = self.data_api.take_pending();
         if !data_updates.is_empty() {
             let changes = data_updates
@@ -1859,7 +2120,10 @@ impl Render for Graph {
             self.data_api.sync(&self.model.nodes, &self.model.edges);
             self.data_api_sync_revision = data_api_revision;
         }
-        self.sync();
+        {
+            let _scope = profile::scope(Phase::Sync);
+            self.sync();
+        }
         if self.fit_on_load_pending {
             self.fit_to_view(window.viewport_size(), px(40.0));
             self.fit_on_load_pending = false;
@@ -1867,28 +2131,41 @@ impl Render for Graph {
         let viewport = self.viewport;
         let renderer = self.renderer.clone();
         let style = renderer.style().clone();
-        let visible_nodes = if self.only_render_visible_elements {
+        let _cull = profile::scope(Phase::Cull);
+        let culled = if self.only_render_visible_elements {
             let size = window.viewport_size();
             let a = self.viewport.screen_to_world(point(px(0.0), px(0.0)));
             let b = self
                 .viewport
                 .screen_to_world(point(size.width, size.height));
-            Some(Rc::new(
-                self.model
-                    .store
-                    .visibility
-                    .visible(WorldBounds::new(
-                        WorldPoint::new(a.x.min(b.x), a.y.min(b.y)),
-                        crate::WorldSize::new((a.x - b.x).abs(), (a.y - b.y).abs()),
-                    ))
-                    .collect::<std::collections::HashSet<_>>(),
-            ))
+            let camera = WorldBounds::new(
+                WorldPoint::new(a.x.min(b.x), a.y.min(b.y)),
+                crate::WorldSize::new((a.x - b.x).abs(), (a.y - b.y).abs()),
+            );
+            // Taken out and put back so the cull can borrow the store's
+            // columns and its index at the same time.
+            let mut indices = std::mem::take(&mut self.visible_indices);
+            let mut flags = std::mem::take(&mut self.visible_flags);
+            let store = &mut self.model.store;
+            store.visibility.cull(
+                &store.columns,
+                camera,
+                Rc::make_mut(&mut indices),
+                Rc::make_mut(&mut flags),
+            );
+            self.visible_indices = indices;
+            self.visible_flags = flags;
+            true
         } else {
-            None
+            false
         };
-        self.refresh_scene(&renderer, viewport.zoom());
+        let visible_nodes = culled.then(|| self.visible_flags.clone());
+        drop(_cull);
+        {
+            let _scope = profile::scope(Phase::Scene);
+            self.refresh_scene(&renderer, viewport.zoom());
+        }
         let hidden = self.scene.hidden.clone();
-        let node_ids = self.scene.node_ids.clone();
         let positions = self.scene.positions.clone();
         let node_sizes = self.scene.node_sizes.clone();
         let node_appearances = self.scene.node_appearances.clone();
@@ -1902,40 +2179,33 @@ impl Render for Graph {
         let target_handle_position = self.target_handle_position;
         let source_handle_position = self.source_handle_position;
         let show_resize_handles = self.show_resize_handles;
-        let resize_directions = self
-            .model
-            .nodes
-            .iter()
-            .map(|node| node.resize_directions.clone())
-            .collect::<Vec<_>>();
-        let show_resize_controls = self
-            .model
-            .nodes
-            .iter()
-            .map(|node| node.show_resize_controls)
-            .collect::<Vec<_>>();
-        let resize_controls_always_visible = self
-            .model
-            .nodes
-            .iter()
-            .map(|node| node.resize_controls_always_visible)
-            .collect::<Vec<_>>();
-        let resize_control_colors = self
-            .model
-            .nodes
-            .iter()
-            .map(|node| node.resize_control_color)
-            .collect::<Vec<_>>();
+        let resize_directions = self.scene.resize_directions.clone();
+        let show_resize_controls = self.scene.show_resize_controls.clone();
+        let resize_controls_always_visible = self.scene.resize_controls_always_visible.clone();
+        let resize_control_colors = self.scene.resize_control_colors.clone();
         let selected_edges = self.scene.selected_edges.clone();
         let edges = self.layout_edges.clone();
-        let edge_stride = renderer.interactive_edge_stride(edges.len(), self.playing);
+        // Fold the frame that just elapsed into the detail control loop, then
+        // draw this one at whatever detail the measurement says fits. The
+        // static budget stays the ceiling; the governor only ever removes
+        // more, so an application that asked for a modest budget keeps it.
+        let governor_stride = match style.frame_budget_ms {
+            Some(target_ms) => {
+                let now = std::time::Instant::now();
+                if let Some(previous) = self.last_frame.replace(now) {
+                    self.last_frame_ms = now.duration_since(previous).as_secs_f32() * 1_000.0;
+                    self.governor.observe(self.last_frame_ms, target_ms);
+                }
+                self.governor.stride()
+            }
+            None => 1,
+        };
+        let edge_stride = renderer
+            .interactive_edge_stride(edges.len(), self.playing)
+            .max(governor_stride);
+        let edge_lod_min_pixels = style.edge_lod_min_pixels;
         let reconnecting_edge = reconnecting_edge_id(&self.connection.state);
         let temporary_edge_preview = self.temporary_edge_preview;
-        let default_node = NodeAppearance {
-            color: style.node_color,
-            radius_pixels: renderer.node_radius_pixels(viewport.zoom()),
-            shape: NodeShape::Square,
-        };
         let default_edge = EdgeAppearance {
             color: style.edge_color,
             width_pixels: style.edge_width_pixels,
@@ -1976,16 +2246,34 @@ impl Render for Graph {
             (viewport_size.width / px(1.0)).to_bits(),
             (viewport_size.height / px(1.0)).to_bits(),
         );
+        // Level-of-detail selection for element content. A node renders its
+        // registered element tree only while it is large enough on screen for
+        // that detail to be legible, and only while the frame's budget lasts.
+        // Every other node keeps its position, size, and colors and is drawn
+        // from the scene columns instead, so nothing disappears - the
+        // representation gets cheaper, the graph does not get emptier.
+        let content_present = self.content_present.clone();
+        let node_order = self.scene.node_order.clone();
+        select_content_lod(
+            &node_order,
+            &hidden,
+            &content_present,
+            visible_nodes.as_deref().map(Vec::as_slice),
+            &node_sizes,
+            viewport.zoom(),
+            style.content_lod_min_pixels,
+            style.content_budget,
+            Rc::make_mut(&mut self.content_drawn),
+        );
+        let content_drawn = self.content_drawn.clone();
+        let has_content = content_present.clone();
+
         let mut uncached_node_contents = Vec::new();
-        for index in self.scene.node_order.iter().copied() {
-            let node = &self.model.nodes[index];
-            if hidden[index]
-                || visible_nodes
-                    .as_ref()
-                    .is_some_and(|visible| !visible.contains(&node.id))
-            {
+        for index in node_order.iter().copied() {
+            if !content_drawn[index] {
                 continue;
             }
+            let node = &self.model.nodes[index];
             let Some((content_renderer, cached)) = renderer.node_content_renderer(node) else {
                 continue;
             };
@@ -2005,19 +2293,16 @@ impl Render for Graph {
                     .child(content_renderer.render(node, viewport.zoom())),
             );
         }
+        let _content = profile::scope(Phase::Content);
         if self.node_content_layer_revision != Some(content_revision) {
             self.node_content_cache
                 .retain(|id, _| self.model.store.node_lookup.contains_key(id));
             let mut items = Vec::new();
-            for index in self.scene.node_order.iter().copied() {
-                let node = &self.model.nodes[index];
-                if hidden[index]
-                    || visible_nodes
-                        .as_ref()
-                        .is_some_and(|visible| !visible.contains(&node.id))
-                {
+            for index in node_order.iter().copied() {
+                if !content_drawn[index] {
                     continue;
                 }
+                let node = &self.model.nodes[index];
                 let Some((content_renderer, cached)) = renderer.node_content_renderer(node) else {
                     continue;
                 };
@@ -2063,6 +2348,31 @@ impl Render for Graph {
             });
             self.node_content_layer_revision = Some(content_revision);
         }
+        drop(_content);
+        profile::count(
+            Counter::VisibleNodes,
+            if culled {
+                self.visible_indices.len()
+            } else {
+                self.model.nodes.len()
+            },
+        );
+        if profile::enabled() {
+            profile::count(
+                Counter::ContentNodes,
+                self.content_drawn.iter().filter(|drawn| **drawn).count(),
+            );
+        }
+        profile::frame(
+            self.model.nodes.len(),
+            self.model.edges.len(),
+            if culled {
+                self.visible_indices.len()
+            } else {
+                self.model.nodes.len()
+            },
+            self.node_content_cache.len(),
+        );
         let node_content_layer = self.node_content_layer.clone();
         if self.data_api.has_pending() {
             cx.notify();
@@ -2071,156 +2381,125 @@ impl Render for Graph {
         let graph_canvas = canvas(
             |_bounds, _window, _cx| (),
             move |bounds, _, window, _cx| {
+                let _scope = profile::scope(Phase::Paint);
                 let st = (point(0., 1.), point(0., 1.), point(0., 1.));
-                let mut edge_path = Path::new(point(px(0.0), px(0.0)));
-                for (edge_index, edge) in edges.iter().enumerate().step_by(edge_stride) {
-                    if reconnecting_edge == Some(edge_ids[edge_index]) {
-                        continue;
-                    }
-                    if hidden[edge.source] || hidden[edge.target] {
-                        continue;
-                    }
-                    if visible_nodes.as_ref().is_some_and(|visible| {
-                        !visible.contains(&node_ids[edge.source])
-                            && !visible.contains(&node_ids[edge.target])
-                    }) {
-                        continue;
-                    }
-                    if edge_appearances[edge_index] != default_edge
-                        || edge_kinds[edge_index] != EdgeKind::Straight
-                    {
-                        continue;
-                    }
-                    let p1 = viewport.world_to_screen(positions[edge.source]);
-                    let p2 = viewport.world_to_screen(positions[edge.target]);
-                    if (p1.x < bounds.left() && p2.x < bounds.left())
-                        || (p1.x > bounds.right() && p2.x > bounds.right())
-                        || (p1.y < bounds.top() && p2.y < bounds.top())
-                        || (p1.y > bounds.bottom() && p2.y > bounds.bottom())
-                    {
-                        continue;
-                    }
-                    let direction = point(p2.x - p1.x, p2.y - p1.y);
-                    let length = direction.magnitude() as f32;
-                    if length <= 0.0001 {
-                        continue;
-                    }
-                    let normal = point(-direction.y, direction.x)
-                        * (style.edge_width_pixels.max(0.25) / length);
-                    let p1a = point(p1.x + normal.x, p1.y + normal.y);
-                    let p1b = point(p1.x - normal.x, p1.y - normal.y);
-                    let p2a = point(p2.x + normal.x, p2.y + normal.y);
-                    let p2b = point(p2.x - normal.x, p2.y - normal.y);
-                    edge_path.push_triangle((p1a, p1b, p2a), st);
-                    edge_path.push_triangle((p2a, p1b, p2b), st);
-                }
-                window.paint_path(edge_path, rgba((style.edge_color << 8) | 0x30));
-
-                if let Some((from, to)) = temporary_edge_preview {
-                    let from = viewport.world_to_screen(from);
-                    let to = viewport.world_to_screen(to);
-                    let delta = point(to.x - from.x, to.y - from.y);
-                    let length = delta.magnitude() as f32;
-                    let dots = (length / 10.0).floor().max(2.0) as usize;
-                    for index in 0..=dots {
-                        let t = index as f32 / dots as f32;
-                        let center = point(from.x + delta.x * t, from.y + delta.y * t);
-                        window.paint_quad(fill(
-                            Bounds::centered_at(center, size(px(3.0), px(3.0))),
-                            rgba(0x7f8792d9),
-                        ));
-                    }
-                }
-
-                for (edge_index, edge) in edges.iter().enumerate().step_by(edge_stride) {
-                    if reconnecting_edge == Some(edge_ids[edge_index]) {
-                        continue;
-                    }
-                    if hidden[edge.source] || hidden[edge.target] {
-                        continue;
-                    }
-                    if visible_nodes.as_ref().is_some_and(|visible| {
-                        !visible.contains(&node_ids[edge.source])
-                            && !visible.contains(&node_ids[edge.target])
-                    }) {
-                        continue;
-                    }
-                    let appearance = edge_appearances[edge_index];
-                    let kind = edge_kinds[edge_index];
-                    if appearance == default_edge && kind == EdgeKind::Straight {
-                        continue;
-                    }
-                    // Straight edges carry no cached geometry; a custom
-                    // appearance on one still has to be drawn here, from its
-                    // endpoints.
-                    let straight;
-                    let world_points = match &edge_geometries[edge_index] {
-                        Some(points) => points,
-                        None => {
-                            straight = [positions[edge.source], positions[edge.target]];
-                            &straight[..]
-                        }
-                    };
-                    let mut path = Path::new(viewport.world_to_screen(world_points[0]));
-                    for pair in world_points.windows(2) {
-                        let p1 = viewport.world_to_screen(pair[0]);
-                        let p2 = viewport.world_to_screen(pair[1]);
-                        let direction = point(p2.x - p1.x, p2.y - p1.y);
-                        let length = direction.magnitude() as f32;
-                        if length <= 0.0001 {
-                            continue;
-                        }
-                        let normal = point(-direction.y, direction.x)
-                            * (appearance.width_pixels.max(0.25) / length);
-                        path.push_triangle(
-                            (
-                                point(p1.x + normal.x, p1.y + normal.y),
-                                point(p1.x - normal.x, p1.y - normal.y),
-                                point(p2.x + normal.x, p2.y + normal.y),
-                            ),
-                            st,
-                        );
-                        path.push_triangle(
-                            (
-                                point(p2.x + normal.x, p2.y + normal.y),
-                                point(p1.x - normal.x, p1.y - normal.y),
-                                point(p2.x - normal.x, p2.y - normal.y),
-                            ),
-                            st,
-                        );
-                    }
-                    window.paint_path(path, rgba((appearance.color << 8) | 0xff));
-                }
-
-                if !selected_edges.is_empty() {
-                    let mut path = Path::new(point(px(0.0), px(0.0)));
-                    for (edge_id, edge) in selected_edges.iter() {
-                        if reconnecting_edge == Some(*edge_id) {
+                // Every primitive is submitted inside a layer.
+                //
+                // Outside one, gpui derives each primitive's draw order by
+                // inserting its bounds into a tree and testing it against
+                // everything already there, which is a per-primitive cost that
+                // a graph pays thousands of times a frame. A layer resolves
+                // that order once and hands it to everything inside, so
+                // submitting a node body becomes a push onto a vector.
+                //
+                // One layer per pass, in back-to-front order, is also what
+                // keeps edges behind nodes and overlays in front without
+                // sorting anything: the passes are the depth order.
+                window.paint_layer(bounds, |window| {
+                    let _scope = profile::scope(Phase::PaintEdges);
+                    let mut edge_path = Path::new(point(px(0.0), px(0.0)));
+                    for (edge_index, edge) in edges.iter().enumerate().step_by(edge_stride) {
+                        if reconnecting_edge == Some(edge_ids[edge_index]) {
                             continue;
                         }
                         if hidden[edge.source] || hidden[edge.target] {
                             continue;
                         }
-                        if visible_nodes.as_ref().is_some_and(|visible| {
-                            !visible.contains(&node_ids[edge.source])
-                                && !visible.contains(&node_ids[edge.target])
-                        }) {
+                        if visible_nodes
+                            .as_ref()
+                            .is_some_and(|visible| !visible[edge.source] && !visible[edge.target])
+                        {
                             continue;
                         }
-                        let Some(edge_index) = edge_ids.iter().position(|id| id == edge_id) else {
+                        if edge_appearances[edge_index] != default_edge
+                            || edge_kinds[edge_index] != EdgeKind::Straight
+                        {
                             continue;
-                        };
+                        }
+                        let p1 = viewport.world_to_screen(positions[edge.source]);
+                        let p2 = viewport.world_to_screen(positions[edge.target]);
+                        if (p1.x < bounds.left() && p2.x < bounds.left())
+                            || (p1.x > bounds.right() && p2.x > bounds.right())
+                            || (p1.y < bounds.top() && p2.y < bounds.top())
+                            || (p1.y > bounds.bottom() && p2.y > bounds.bottom())
+                        {
+                            profile::count(Counter::RejectedEdges, 1);
+                            continue;
+                        }
+                        let direction = point(p2.x - p1.x, p2.y - p1.y);
+                        let length = direction.magnitude() as f32;
+                        // Level-of-detail rejection. An edge shorter than a
+                        // couple of pixels connects two nodes that already
+                        // overlap on screen: it costs two triangles and a band
+                        // of fragments to communicate a relationship the
+                        // viewer cannot separate from the nodes themselves.
+                        if length <= edge_lod_min_pixels {
+                            profile::count(Counter::RejectedEdges, 1);
+                            continue;
+                        }
+                        let normal = point(-direction.y, direction.x)
+                            * (style.edge_width_pixels.max(0.25) / length);
+                        let p1a = point(p1.x + normal.x, p1.y + normal.y);
+                        let p1b = point(p1.x - normal.x, p1.y - normal.y);
+                        let p2a = point(p2.x + normal.x, p2.y + normal.y);
+                        let p2b = point(p2.x - normal.x, p2.y - normal.y);
+                        edge_path.push_triangle((p1a, p1b, p2a), st);
+                        edge_path.push_triangle((p2a, p1b, p2b), st);
+                        profile::count(Counter::VisibleEdges, 1);
+                        profile::count(Counter::Triangles, 2);
+                    }
+                    window.paint_path(edge_path, rgba((style.edge_color << 8) | 0x30));
+                    profile::count(Counter::DrawCalls, 1);
+
+                    if let Some((from, to)) = temporary_edge_preview {
+                        let from = viewport.world_to_screen(from);
+                        let to = viewport.world_to_screen(to);
+                        let delta = point(to.x - from.x, to.y - from.y);
+                        let length = delta.magnitude() as f32;
+                        let dots = (length / 10.0).floor().max(2.0) as usize;
+                        for index in 0..=dots {
+                            let t = index as f32 / dots as f32;
+                            let center = point(from.x + delta.x * t, from.y + delta.y * t);
+                            window.paint_quad(fill(
+                                Bounds::centered_at(center, size(px(3.0), px(3.0))),
+                                rgba(0x7f8792d9),
+                            ));
+                        }
+                    }
+
+                    for (edge_index, edge) in edges.iter().enumerate().step_by(edge_stride) {
+                        if reconnecting_edge == Some(edge_ids[edge_index]) {
+                            continue;
+                        }
+                        if hidden[edge.source] || hidden[edge.target] {
+                            continue;
+                        }
+                        if visible_nodes
+                            .as_ref()
+                            .is_some_and(|visible| !visible[edge.source] && !visible[edge.target])
+                        {
+                            continue;
+                        }
+                        let appearance = edge_appearances[edge_index];
+                        let kind = edge_kinds[edge_index];
+                        if appearance == default_edge && kind == EdgeKind::Straight {
+                            continue;
+                        }
+                        // Straight edges carry no cached geometry; a custom
+                        // appearance on one still has to be drawn here, from its
+                        // endpoints.
                         let straight;
-                        let world_points = match &edge_geometries[edge_index] {
+                        let world_points = match edge_geometries
+                            .get(edge_index)
+                            .and_then(|geometry| geometry.as_ref())
+                        {
                             Some(points) => points.as_slice(),
                             None => {
                                 straight = [positions[edge.source], positions[edge.target]];
                                 &straight[..]
                             }
                         };
-                        if world_points.len() < 2 {
-                            continue;
-                        }
+                        let mut path = Path::new(viewport.world_to_screen(world_points[0]));
                         for pair in world_points.windows(2) {
                             let p1 = viewport.world_to_screen(pair[0]);
                             let p2 = viewport.world_to_screen(pair[1]);
@@ -2229,7 +2508,8 @@ impl Render for Graph {
                             if length <= 0.0001 {
                                 continue;
                             }
-                            let normal = point(-direction.y, direction.x) * (2.0 / length);
+                            let normal = point(-direction.y, direction.x)
+                                * (appearance.width_pixels.max(0.25) / length);
                             path.push_triangle(
                                 (
                                     point(p1.x + normal.x, p1.y + normal.y),
@@ -2247,382 +2527,503 @@ impl Render for Graph {
                                 st,
                             );
                         }
-                        let endpoint_size = px(RECONNECT_HANDLE_SIZE_WORLD * viewport.zoom());
-                        let endpoints = [
-                            viewport.world_to_screen(world_points[0]),
-                            viewport.world_to_screen(world_points[world_points.len() - 1]),
-                        ];
-                        for endpoint in endpoints {
-                            window.paint_quad(fill(
-                                Bounds::centered_at(endpoint, size(endpoint_size, endpoint_size)),
-                                rgb(0xffffff),
-                            ));
-                            window.paint_quad(outline(
-                                Bounds::centered_at(endpoint, size(endpoint_size, endpoint_size)),
-                                rgb(style.selection_color),
-                                BorderStyle::default(),
-                            ));
+                        window.paint_path(path, rgba((appearance.color << 8) | 0xff));
+                    }
+
+                    if !selected_edges.is_empty() {
+                        let mut path = Path::new(point(px(0.0), px(0.0)));
+                        for (edge_index, edge) in selected_edges.iter().copied() {
+                            if reconnecting_edge == Some(edge_ids[edge_index]) {
+                                continue;
+                            }
+                            if hidden[edge.source] || hidden[edge.target] {
+                                continue;
+                            }
+                            if visible_nodes.as_ref().is_some_and(|visible| {
+                                !visible[edge.source] && !visible[edge.target]
+                            }) {
+                                continue;
+                            }
+                            let straight;
+                            let world_points = match edge_geometries
+                                .get(edge_index)
+                                .and_then(|geometry| geometry.as_ref())
+                            {
+                                Some(points) => points.as_slice(),
+                                None => {
+                                    straight = [positions[edge.source], positions[edge.target]];
+                                    &straight[..]
+                                }
+                            };
+                            if world_points.len() < 2 {
+                                continue;
+                            }
+                            for pair in world_points.windows(2) {
+                                let p1 = viewport.world_to_screen(pair[0]);
+                                let p2 = viewport.world_to_screen(pair[1]);
+                                let direction = point(p2.x - p1.x, p2.y - p1.y);
+                                let length = direction.magnitude() as f32;
+                                if length <= 0.0001 {
+                                    continue;
+                                }
+                                let normal = point(-direction.y, direction.x) * (2.0 / length);
+                                path.push_triangle(
+                                    (
+                                        point(p1.x + normal.x, p1.y + normal.y),
+                                        point(p1.x - normal.x, p1.y - normal.y),
+                                        point(p2.x + normal.x, p2.y + normal.y),
+                                    ),
+                                    st,
+                                );
+                                path.push_triangle(
+                                    (
+                                        point(p2.x + normal.x, p2.y + normal.y),
+                                        point(p1.x - normal.x, p1.y - normal.y),
+                                        point(p2.x - normal.x, p2.y - normal.y),
+                                    ),
+                                    st,
+                                );
+                            }
+                            let endpoint_size = px(RECONNECT_HANDLE_SIZE_WORLD * viewport.zoom());
+                            let endpoints = [
+                                viewport.world_to_screen(world_points[0]),
+                                viewport.world_to_screen(world_points[world_points.len() - 1]),
+                            ];
+                            for endpoint in endpoints {
+                                window.paint_quad(fill(
+                                    Bounds::centered_at(
+                                        endpoint,
+                                        size(endpoint_size, endpoint_size),
+                                    ),
+                                    rgb(0xffffff),
+                                ));
+                                window.paint_quad(outline(
+                                    Bounds::centered_at(
+                                        endpoint,
+                                        size(endpoint_size, endpoint_size),
+                                    ),
+                                    rgb(style.selection_color),
+                                    BorderStyle::default(),
+                                ));
+                            }
+                        }
+                        window.paint_path(path, rgb(style.selection_color));
+                    }
+
+                    let mut marker_path = Path::new(point(px(0.0), px(0.0)));
+                    for (index, edge) in edges.iter().enumerate() {
+                        if reconnecting_edge == Some(edge_ids[index]) {
+                            continue;
+                        }
+                        if hidden[edge.source] || hidden[edge.target] {
+                            continue;
+                        }
+                        if visible_nodes
+                            .as_ref()
+                            .is_some_and(|visible| !visible[edge.source] && !visible[edge.target])
+                        {
+                            continue;
+                        }
+                        let (start_marker, end_marker) = edge_markers[index];
+                        if !start_marker && !end_marker {
+                            continue;
+                        }
+                        let a = viewport.world_to_screen(positions[edge.source]);
+                        let b = viewport.world_to_screen(positions[edge.target]);
+                        let dx = (b.x - a.x) / px(1.0);
+                        let dy = (b.y - a.y) / px(1.0);
+                        let length = (dx * dx + dy * dy).sqrt();
+                        if length <= 0.0001 {
+                            continue;
+                        }
+                        let ux = dx / length;
+                        let uy = dy / length;
+                        let normal = point(px(-uy * 4.0), px(ux * 4.0));
+                        if end_marker {
+                            let base = point(b.x - px(ux * 9.0), b.y - px(uy * 9.0));
+                            marker_path.push_triangle(
+                                (
+                                    b,
+                                    point(base.x + normal.x, base.y + normal.y),
+                                    point(base.x - normal.x, base.y - normal.y),
+                                ),
+                                st,
+                            )
+                        }
+                        if start_marker {
+                            let base = point(a.x + px(ux * 9.0), a.y + px(uy * 9.0));
+                            marker_path.push_triangle(
+                                (
+                                    a,
+                                    point(base.x + normal.x, base.y + normal.y),
+                                    point(base.x - normal.x, base.y - normal.y),
+                                ),
+                                st,
+                            )
                         }
                     }
-                    window.paint_path(path, rgb(style.selection_color));
-                }
+                    window.paint_path(marker_path, rgb(style.edge_color));
+                    profile::count(Counter::DrawCalls, 1);
+                });
 
-                let mut marker_path = Path::new(point(px(0.0), px(0.0)));
-                for (index, edge) in edges.iter().enumerate() {
-                    if reconnecting_edge == Some(edge_ids[index]) {
-                        continue;
-                    }
-                    if hidden[edge.source] || hidden[edge.target] {
-                        continue;
-                    }
-                    if visible_nodes.as_ref().is_some_and(|visible| {
-                        !visible.contains(&node_ids[edge.source])
-                            && !visible.contains(&node_ids[edge.target])
-                    }) {
-                        continue;
-                    }
-                    let (start_marker, end_marker) = edge_markers[index];
-                    if !start_marker && !end_marker {
-                        continue;
-                    }
-                    let a = viewport.world_to_screen(positions[edge.source]);
-                    let b = viewport.world_to_screen(positions[edge.target]);
-                    let dx = (b.x - a.x) / px(1.0);
-                    let dy = (b.y - a.y) / px(1.0);
-                    let length = (dx * dx + dy * dy).sqrt();
-                    if length <= 0.0001 {
-                        continue;
-                    }
-                    let ux = dx / length;
-                    let uy = dy / length;
-                    let normal = point(px(-uy * 4.0), px(ux * 4.0));
-                    if end_marker {
-                        let base = point(b.x - px(ux * 9.0), b.y - px(uy * 9.0));
-                        marker_path.push_triangle(
-                            (
-                                b,
-                                point(base.x + normal.x, base.y + normal.y),
-                                point(base.x - normal.x, base.y - normal.y),
-                            ),
-                            st,
-                        )
-                    }
-                    if start_marker {
-                        let base = point(a.x + px(ux * 9.0), a.y + px(uy * 9.0));
-                        marker_path.push_triangle(
-                            (
-                                a,
-                                point(base.x + normal.x, base.y + normal.y),
-                                point(base.x - normal.x, base.y - normal.y),
-                            ),
-                            st,
-                        )
-                    }
-                }
-                window.paint_path(marker_path, rgb(style.edge_color));
+                window.paint_layer(bounds, |window| {
+                    let _scope = profile::scope(Phase::PaintNodes);
 
-                if let Some((a, b, valid)) = connection_line {
-                    let p1 = viewport.world_to_screen(a);
-                    let p2 = viewport.world_to_screen(b);
-                    let direction = point(p2.x - p1.x, p2.y - p1.y);
-                    let length = direction.magnitude() as f32;
-                    if length > 0.0001 {
-                        let normal = point(-direction.y, direction.x) * (1.5 / length);
-                        let mut path = Path::new(p1);
-                        path.push_triangle(
-                            (
-                                point(p1.x + normal.x, p1.y + normal.y),
-                                point(p1.x - normal.x, p1.y - normal.y),
-                                point(p2.x + normal.x, p2.y + normal.y),
-                            ),
-                            st,
-                        );
-                        path.push_triangle(
-                            (
-                                point(p2.x + normal.x, p2.y + normal.y),
-                                point(p1.x - normal.x, p1.y - normal.y),
-                                point(p2.x - normal.x, p2.y - normal.y),
-                            ),
-                            st,
-                        );
-                        window.paint_path(
-                            path,
-                            rgb(if valid == Some(false) {
-                                0xd14343
-                            } else {
-                                0x1e90ff
-                            }),
-                        );
-                    }
-                }
-
-                let radius = px(default_node.radius_pixels);
-                let mut node_path = Path::new(point(px(0.0), px(0.0)));
-                for (index, position) in positions.iter().enumerate() {
-                    if hidden[index] {
-                        continue;
-                    }
-                    if visible_nodes
-                        .as_ref()
-                        .is_some_and(|visible| !visible.contains(&node_ids[index]))
-                    {
-                        continue;
-                    }
-                    if node_appearances[index] != default_node {
-                        continue;
-                    }
-                    let center = viewport.world_to_screen(*position);
-                    if !bounds.contains(&center) {
-                        continue;
-                    }
-                    let a = point(center.x - radius, center.y - radius);
-                    let b = point(center.x + radius, center.y - radius);
-                    let c = point(center.x + radius, center.y + radius);
-                    let d = point(center.x - radius, center.y + radius);
-                    node_path.push_triangle((a, b, c), st);
-                    node_path.push_triangle((a, c, d), st);
-                }
-                window.paint_path(node_path, rgb(style.node_color));
-
-                for (index, position) in positions.iter().enumerate() {
-                    if hidden[index] {
-                        continue;
-                    }
-                    if visible_nodes
-                        .as_ref()
-                        .is_some_and(|visible| !visible.contains(&node_ids[index]))
-                    {
-                        continue;
-                    }
-                    let appearance = node_appearances[index];
-                    if appearance == default_node {
-                        continue;
-                    }
-                    let center = viewport.world_to_screen(*position);
-                    if !bounds.contains(&center) {
-                        continue;
-                    }
-                    let r = px(appearance.radius_pixels);
-                    let mut path = Path::new(center);
-                    match appearance.shape {
-                        NodeShape::None => {}
-                        NodeShape::Square => {
-                            let a = point(center.x - r, center.y - r);
-                            let b = point(center.x + r, center.y - r);
-                            let c = point(center.x + r, center.y + r);
-                            let d = point(center.x - r, center.y + r);
-                            path.push_triangle((a, b, c), st);
-                            path.push_triangle((a, c, d), st)
-                        }
-                        NodeShape::Diamond => {
-                            let a = point(center.x, center.y - r);
-                            let b = point(center.x + r, center.y);
-                            let c = point(center.x, center.y + r);
-                            let d = point(center.x - r, center.y);
-                            path.push_triangle((a, b, c), st);
-                            path.push_triangle((a, c, d), st)
+                    if let Some((a, b, valid)) = connection_line {
+                        let p1 = viewport.world_to_screen(a);
+                        let p2 = viewport.world_to_screen(b);
+                        let direction = point(p2.x - p1.x, p2.y - p1.y);
+                        let length = direction.magnitude() as f32;
+                        if length > 0.0001 {
+                            let normal = point(-direction.y, direction.x) * (1.5 / length);
+                            let mut path = Path::new(p1);
+                            path.push_triangle(
+                                (
+                                    point(p1.x + normal.x, p1.y + normal.y),
+                                    point(p1.x - normal.x, p1.y - normal.y),
+                                    point(p2.x + normal.x, p2.y + normal.y),
+                                ),
+                                st,
+                            );
+                            path.push_triangle(
+                                (
+                                    point(p2.x + normal.x, p2.y + normal.y),
+                                    point(p1.x - normal.x, p1.y - normal.y),
+                                    point(p2.x - normal.x, p2.y - normal.y),
+                                ),
+                                st,
+                            );
+                            window.paint_path(
+                                path,
+                                rgb(if valid == Some(false) {
+                                    0xd14343
+                                } else {
+                                    0x1e90ff
+                                }),
+                            );
                         }
                     }
-                    window.paint_path(path, rgb(appearance.color));
-                }
 
-                if show_handles {
-                    let handle_size = px(CONNECTION_HANDLE_SIZE_WORLD * viewport.zoom());
-                    let outer_half = handle_size * 0.5;
-                    let inner_half = (outer_half - px(1.0)).max(px(0.0));
-                    let mut handle_borders = Path::new(point(px(0.0), px(0.0)));
-                    let mut handle_fills = Path::new(point(px(0.0), px(0.0)));
-                    macro_rules! push_square {
-                        ($path:expr, $center:expr, $half:expr) => {{
-                            let center = $center;
-                            let half = $half;
-                            let a = point(center.x - half, center.y - half);
-                            let b = point(center.x + half, center.y - half);
-                            let c = point(center.x + half, center.y + half);
-                            let d = point(center.x - half, center.y + half);
-                            $path.push_triangle((a, b, c), st);
-                            $path.push_triangle((a, c, d), st);
-                        }};
-                    }
+                    // Node bodies, drawn through a level-of-detail ladder. Every
+                    // visible node is drawn at every zoom level; only its
+                    // representation gets cheaper as it shrinks. A quad is an
+                    // instanced primitive whose corner rounding and border are
+                    // evaluated analytically in the fragment shader, so a screen
+                    // full of node bodies costs one batch rather than one shaped
+                    // path each.
+                    //
+                    // Diamonds are the one shape a quad cannot express, so they
+                    // are deferred into one path per color and flushed after the
+                    // quad run rather than interleaved with it, which would split
+                    // the quad batch once per node.
+                    let mut diamonds: Vec<(u32, Path<Pixels>)> = Vec::new();
                     for (index, position) in positions.iter().enumerate() {
                         if hidden[index] {
                             continue;
                         }
                         if visible_nodes
                             .as_ref()
-                            .is_some_and(|visible| !visible.contains(&node_ids[index]))
+                            .is_some_and(|visible| !visible[index])
                         {
                             continue;
                         }
                         let center = viewport.world_to_screen(*position);
-                        for kind in [HandleKind::Target, HandleKind::Source] {
-                            let handle = connection_handle_position(
-                                center,
-                                node_appearances[index].radius_pixels,
-                                kind,
-                                target_handle_position,
-                                source_handle_position,
-                                viewport.zoom(),
-                            );
-                            push_square!(handle_borders, handle, outer_half);
-                            if inner_half > px(0.0) {
-                                push_square!(handle_fills, handle, inner_half);
+                        if !bounds.contains(&center) {
+                            continue;
+                        }
+                        let appearance = node_appearances[index];
+                        match appearance.shape {
+                            NodeShape::Rect {
+                                corner_radius_world,
+                                border_color,
+                                border_width_pixels,
+                            } => {
+                                let body = Bounds::centered_at(
+                                    center,
+                                    size(
+                                        px((node_sizes[index].width * viewport.zoom()).max(1.0)),
+                                        px((node_sizes[index].height * viewport.zoom()).max(1.0)),
+                                    ),
+                                );
+                                profile::count(Counter::Quads, 1);
+                                if body.size.height < px(SHELL_LOD_MIN_PIXELS) {
+                                    // Sub-pixel corners and borders resolve to
+                                    // nothing a viewer can see, so the flat fill
+                                    // is both cheaper and visually identical.
+                                    window.paint_quad(fill(body, rgb(appearance.color)));
+                                } else {
+                                    window.paint_quad(quad(
+                                        body,
+                                        px(corner_radius_world * viewport.zoom()),
+                                        rgb(appearance.color),
+                                        px(border_width_pixels),
+                                        rgb(border_color),
+                                        BorderStyle::default(),
+                                    ));
+                                }
+                            }
+                            NodeShape::Square => {
+                                profile::count(Counter::Quads, 1);
+                                let diameter = px(appearance.radius_pixels * 2.0);
+                                window.paint_quad(fill(
+                                    Bounds::centered_at(center, size(diameter, diameter)),
+                                    rgb(appearance.color),
+                                ));
+                            }
+                            NodeShape::Diamond => {
+                                let r = px(appearance.radius_pixels);
+                                let path = match diamonds
+                                    .iter_mut()
+                                    .find(|(color, _)| *color == appearance.color)
+                                {
+                                    Some((_, path)) => path,
+                                    None => {
+                                        diamonds.push((
+                                            appearance.color,
+                                            Path::new(point(px(0.0), px(0.0))),
+                                        ));
+                                        &mut diamonds.last_mut().expect("just pushed").1
+                                    }
+                                };
+                                let a = point(center.x, center.y - r);
+                                let b = point(center.x + r, center.y);
+                                let c = point(center.x, center.y + r);
+                                let d = point(center.x - r, center.y);
+                                path.push_triangle((a, b, c), st);
+                                path.push_triangle((a, c, d), st);
+                            }
+                            NodeShape::None => {
+                                // A node whose element content was dropped by the
+                                // content budget still has to appear. Its own fill
+                                // is the only description of it the graph has.
+                                if has_content[index] && !content_drawn[index] {
+                                    window.paint_quad(fill(
+                                        Bounds::centered_at(
+                                            center,
+                                            size(
+                                                px((node_sizes[index].width * viewport.zoom())
+                                                    .max(1.0)),
+                                                px((node_sizes[index].height * viewport.zoom())
+                                                    .max(1.0)),
+                                            ),
+                                        ),
+                                        rgb(appearance.color),
+                                    ));
+                                }
                             }
                         }
                     }
-                    window.paint_path(handle_borders, rgb(0x1e90ff));
-                    window.paint_path(handle_fills, rgb(0xffffff));
-                }
+                    for (color, path) in diamonds {
+                        window.paint_path(path, rgb(color));
+                        profile::count(Counter::DrawCalls, 1);
+                    }
+                });
 
-                for &index in selected.iter() {
-                    if hidden[index] {
-                        continue;
-                    }
-                    if visible_nodes
-                        .as_ref()
-                        .is_some_and(|visible| !visible.contains(&node_ids[index]))
-                    {
-                        continue;
-                    }
-                    let center = viewport.world_to_screen(positions[index]);
-                    let selection_size = if matches!(node_appearances[index].shape, NodeShape::None)
-                    {
-                        size(
-                            px((node_sizes[index].width * viewport.zoom()).max(1.0)),
-                            px((node_sizes[index].height * viewport.zoom()).max(1.0)),
-                        )
-                    } else {
-                        size(px(18.0), px(18.0))
-                    };
-                    window.paint_quad(outline(
-                        Bounds::centered_at(center, selection_size),
-                        rgb(style.selection_color),
-                        BorderStyle::default(),
-                    ));
-                    if !show_handles {
+                window.paint_layer(bounds, |window| {
+                    let _scope = profile::scope(Phase::PaintOverlays);
+
+                    if show_handles {
                         let handle_size = px(CONNECTION_HANDLE_SIZE_WORLD * viewport.zoom());
-                        for kind in [HandleKind::Target, HandleKind::Source] {
-                            let handle = connection_handle_position(
-                                center,
-                                node_appearances[index].radius_pixels,
-                                kind,
-                                target_handle_position,
-                                source_handle_position,
-                                viewport.zoom(),
-                            );
-                            window.paint_quad(fill(
-                                Bounds::centered_at(handle, size(handle_size, handle_size)),
-                                rgb(0xffffff),
-                            ));
-                            window.paint_quad(outline(
-                                Bounds::centered_at(handle, size(handle_size, handle_size)),
-                                rgb(0x1e90ff),
-                                BorderStyle::default(),
-                            ));
+                        let outer_half = handle_size * 0.5;
+                        let inner_half = (outer_half - px(1.0)).max(px(0.0));
+                        let mut handle_borders = Path::new(point(px(0.0), px(0.0)));
+                        let mut handle_fills = Path::new(point(px(0.0), px(0.0)));
+                        macro_rules! push_square {
+                            ($path:expr, $center:expr, $half:expr) => {{
+                                let center = $center;
+                                let half = $half;
+                                let a = point(center.x - half, center.y - half);
+                                let b = point(center.x + half, center.y - half);
+                                let c = point(center.x + half, center.y + half);
+                                let d = point(center.x - half, center.y + half);
+                                $path.push_triangle((a, b, c), st);
+                                $path.push_triangle((a, c, d), st);
+                            }};
                         }
-                    }
-                    if show_resize_handles && show_resize_controls[index] {
-                        let resize_color =
-                            resize_control_colors[index].unwrap_or(style.selection_color);
-                        for direction in resize_directions[index]
-                            .as_deref()
-                            .unwrap_or(&RESIZE_DIRECTIONS)
-                            .iter()
-                            .copied()
-                        {
-                            let resize = resize_handle_position(
-                                center,
-                                node_sizes[index],
-                                viewport.zoom(),
-                                direction,
-                            );
-                            let handle_size = if matches!(
-                                direction,
-                                crate::ResizeDirection::NorthWest
-                                    | crate::ResizeDirection::NorthEast
-                                    | crate::ResizeDirection::SouthEast
-                                    | crate::ResizeDirection::SouthWest
-                            ) {
-                                px(8.0)
-                            } else {
-                                px(7.0)
-                            };
-                            let corner = matches!(
-                                direction,
-                                crate::ResizeDirection::NorthWest
-                                    | crate::ResizeDirection::NorthEast
-                                    | crate::ResizeDirection::SouthEast
-                                    | crate::ResizeDirection::SouthWest
-                            );
-                            window.paint_quad(fill(
-                                Bounds::centered_at(resize, size(handle_size, handle_size)),
-                                rgb(if corner { resize_color } else { 0xffffff }),
-                            ));
-                            window.paint_quad(outline(
-                                Bounds::centered_at(resize, size(handle_size, handle_size)),
-                                rgb(resize_color),
-                                BorderStyle::default(),
-                            ));
-                        }
-                    }
-                }
-                if show_resize_handles {
-                    for (index, always_visible) in
-                        resize_controls_always_visible.iter().copied().enumerate()
-                    {
-                        if !always_visible
-                            || selected.contains(&index)
-                            || hidden[index]
-                            || !show_resize_controls[index]
-                            || visible_nodes
+                        for (index, position) in positions.iter().enumerate() {
+                            if hidden[index] {
+                                continue;
+                            }
+                            if visible_nodes
                                 .as_ref()
-                                .is_some_and(|visible| !visible.contains(&node_ids[index]))
+                                .is_some_and(|visible| !visible[index])
+                            {
+                                continue;
+                            }
+                            let center = viewport.world_to_screen(*position);
+                            for kind in [HandleKind::Target, HandleKind::Source] {
+                                let handle = connection_handle_position(
+                                    center,
+                                    node_appearances[index].radius_pixels,
+                                    kind,
+                                    target_handle_position,
+                                    source_handle_position,
+                                    viewport.zoom(),
+                                );
+                                push_square!(handle_borders, handle, outer_half);
+                                if inner_half > px(0.0) {
+                                    push_square!(handle_fills, handle, inner_half);
+                                }
+                            }
+                        }
+                        window.paint_path(handle_borders, rgb(0x1e90ff));
+                        window.paint_path(handle_fills, rgb(0xffffff));
+                    }
+
+                    for &index in selected.iter() {
+                        if hidden[index] {
+                            continue;
+                        }
+                        if visible_nodes
+                            .as_ref()
+                            .is_some_and(|visible| !visible[index])
                         {
                             continue;
                         }
                         let center = viewport.world_to_screen(positions[index]);
-                        let resize_color =
-                            resize_control_colors[index].unwrap_or(style.selection_color);
-                        for direction in resize_directions[index]
-                            .as_deref()
-                            .unwrap_or(&RESIZE_DIRECTIONS)
-                            .iter()
-                            .copied()
-                        {
-                            let resize = resize_handle_position(
-                                center,
-                                node_sizes[index],
-                                viewport.zoom(),
-                                direction,
-                            );
-                            let corner = matches!(
-                                direction,
-                                crate::ResizeDirection::NorthWest
-                                    | crate::ResizeDirection::NorthEast
-                                    | crate::ResizeDirection::SouthEast
-                                    | crate::ResizeDirection::SouthWest
-                            );
-                            let handle_size = if corner { px(8.0) } else { px(7.0) };
-                            window.paint_quad(fill(
-                                Bounds::centered_at(resize, size(handle_size, handle_size)),
-                                rgb(if corner { resize_color } else { 0xffffff }),
-                            ));
-                            window.paint_quad(outline(
-                                Bounds::centered_at(resize, size(handle_size, handle_size)),
-                                rgb(resize_color),
-                                BorderStyle::default(),
-                            ));
+                        let selection_size =
+                            if matches!(node_appearances[index].shape, NodeShape::None) {
+                                size(
+                                    px((node_sizes[index].width * viewport.zoom()).max(1.0)),
+                                    px((node_sizes[index].height * viewport.zoom()).max(1.0)),
+                                )
+                            } else {
+                                size(px(18.0), px(18.0))
+                            };
+                        window.paint_quad(outline(
+                            Bounds::centered_at(center, selection_size),
+                            rgb(style.selection_color),
+                            BorderStyle::default(),
+                        ));
+                        if !show_handles {
+                            let handle_size = px(CONNECTION_HANDLE_SIZE_WORLD * viewport.zoom());
+                            for kind in [HandleKind::Target, HandleKind::Source] {
+                                let handle = connection_handle_position(
+                                    center,
+                                    node_appearances[index].radius_pixels,
+                                    kind,
+                                    target_handle_position,
+                                    source_handle_position,
+                                    viewport.zoom(),
+                                );
+                                window.paint_quad(fill(
+                                    Bounds::centered_at(handle, size(handle_size, handle_size)),
+                                    rgb(0xffffff),
+                                ));
+                                window.paint_quad(outline(
+                                    Bounds::centered_at(handle, size(handle_size, handle_size)),
+                                    rgb(0x1e90ff),
+                                    BorderStyle::default(),
+                                ));
+                            }
+                        }
+                        if show_resize_handles && show_resize_controls[index] {
+                            let resize_color =
+                                resize_control_colors[index].unwrap_or(style.selection_color);
+                            for direction in resize_directions[index]
+                                .as_deref()
+                                .unwrap_or(&RESIZE_DIRECTIONS)
+                                .iter()
+                                .copied()
+                            {
+                                let resize = resize_handle_position(
+                                    center,
+                                    node_sizes[index],
+                                    viewport.zoom(),
+                                    direction,
+                                );
+                                let handle_size = if matches!(
+                                    direction,
+                                    crate::ResizeDirection::NorthWest
+                                        | crate::ResizeDirection::NorthEast
+                                        | crate::ResizeDirection::SouthEast
+                                        | crate::ResizeDirection::SouthWest
+                                ) {
+                                    px(8.0)
+                                } else {
+                                    px(7.0)
+                                };
+                                let corner = matches!(
+                                    direction,
+                                    crate::ResizeDirection::NorthWest
+                                        | crate::ResizeDirection::NorthEast
+                                        | crate::ResizeDirection::SouthEast
+                                        | crate::ResizeDirection::SouthWest
+                                );
+                                window.paint_quad(fill(
+                                    Bounds::centered_at(resize, size(handle_size, handle_size)),
+                                    rgb(if corner { resize_color } else { 0xffffff }),
+                                ));
+                                window.paint_quad(outline(
+                                    Bounds::centered_at(resize, size(handle_size, handle_size)),
+                                    rgb(resize_color),
+                                    BorderStyle::default(),
+                                ));
+                            }
                         }
                     }
-                }
-                if let Some((start, end)) = marquee {
-                    let origin = point(start.x.min(end.x), start.y.min(end.y));
-                    let rectangle = Bounds::new(
-                        origin,
-                        size((start.x - end.x).abs(), (start.y - end.y).abs()),
-                    );
-                    window.paint_quad(outline(rectangle, rgba(0x1e90ffb0), BorderStyle::default()));
-                }
+                    if show_resize_handles {
+                        for (index, always_visible) in
+                            resize_controls_always_visible.iter().copied().enumerate()
+                        {
+                            if !always_visible
+                                || selected.contains(&index)
+                                || hidden[index]
+                                || !show_resize_controls[index]
+                                || visible_nodes
+                                    .as_ref()
+                                    .is_some_and(|visible| !visible[index])
+                            {
+                                continue;
+                            }
+                            let center = viewport.world_to_screen(positions[index]);
+                            let resize_color =
+                                resize_control_colors[index].unwrap_or(style.selection_color);
+                            for direction in resize_directions[index]
+                                .as_deref()
+                                .unwrap_or(&RESIZE_DIRECTIONS)
+                                .iter()
+                                .copied()
+                            {
+                                let resize = resize_handle_position(
+                                    center,
+                                    node_sizes[index],
+                                    viewport.zoom(),
+                                    direction,
+                                );
+                                let corner = matches!(
+                                    direction,
+                                    crate::ResizeDirection::NorthWest
+                                        | crate::ResizeDirection::NorthEast
+                                        | crate::ResizeDirection::SouthEast
+                                        | crate::ResizeDirection::SouthWest
+                                );
+                                let handle_size = if corner { px(8.0) } else { px(7.0) };
+                                window.paint_quad(fill(
+                                    Bounds::centered_at(resize, size(handle_size, handle_size)),
+                                    rgb(if corner { resize_color } else { 0xffffff }),
+                                ));
+                                window.paint_quad(outline(
+                                    Bounds::centered_at(resize, size(handle_size, handle_size)),
+                                    rgb(resize_color),
+                                    BorderStyle::default(),
+                                ));
+                            }
+                        }
+                    }
+                    if let Some((start, end)) = marquee {
+                        let origin = point(start.x.min(end.x), start.y.min(end.y));
+                        let rectangle = Bounds::new(
+                            origin,
+                            size((start.x - end.x).abs(), (start.y - end.y).abs()),
+                        );
+                        window.paint_quad(outline(
+                            rectangle,
+                            rgba(0x1e90ffb0),
+                            BorderStyle::default(),
+                        ));
+                    }
+                });
             },
         )
         .absolute()
@@ -2651,8 +3052,7 @@ impl Render for Graph {
         .size_full();
 
         let playing = self.playing;
-        let edge_count = self.model.edges.len();
-        let edge_budget = self.renderer.style().interactive_edge_budget;
+        let edge_detail_stride = edge_stride;
         let controls = div()
             .absolute()
             .top(px(8.0))
@@ -2669,12 +3069,12 @@ impl Render for Graph {
             .child(format!(
                 "nodes: {}  edges: {}",
                 self.model.nodes.len(),
-                edge_count
+                self.model.edges.len()
             ))
-            .child(if playing && edge_count > edge_budget {
+            .child(if edge_detail_stride > 1 {
                 format!(
-                    "interactive edge LOD: 1/{}",
-                    edge_count.div_ceil(edge_budget)
+                    "edge LOD 1/{edge_detail_stride}  ({:.1} ms avg)",
+                    self.governor.average_ms()
                 )
             } else {
                 "full edge detail".to_string()
@@ -2719,9 +3119,14 @@ impl Render for Graph {
         } else {
             CursorStyle::OpenHand
         };
-        let edge_labels = self
-            .model
-            .edges
+        // Most graphs label no edges at all; walking the edge list every frame
+        // to discover that is a pass worth not taking.
+        let labelled_edges: &[Edge] = if self.scene.any_edge_labels {
+            &self.model.edges
+        } else {
+            &[]
+        };
+        let edge_labels = labelled_edges
             .iter()
             .filter(|edge| reconnecting_edge != Some(edge.id))
             .filter_map(|edge| {
@@ -3144,11 +3549,83 @@ impl Render for Graph {
 
 #[cfg(test)]
 mod tests {
-    use super::{reconnecting_edge_id, GraphDataApi};
+    use super::{reconnecting_edge_id, select_content_lod, GraphDataApi};
+    use crate::WorldSize;
     use crate::{
         ConnectionIntent, ConnectionState, Edge, EdgeId, HandleKey, HandleKind, Node, NodeId,
         WorldPoint,
     };
+
+    /// Level of detail must never remove a node from the frame - it decides
+    /// how a node is drawn, not whether it is. These assertions are about the
+    /// flags the paint pass reads, which is where "cheaper" could turn into
+    /// "missing" by accident.
+    #[test]
+    fn content_level_of_detail_promotes_only_nodes_large_enough_to_read() {
+        let order = [0usize, 1, 2];
+        let hidden = [false, false, false];
+        let present = [true, true, true];
+        let sizes = [
+            WorldSize::new(10.0, 4.0),
+            WorldSize::new(10.0, 40.0),
+            WorldSize::new(10.0, 40.0),
+        ];
+        let mut drawn = Vec::new();
+
+        // At this zoom only the two tall nodes clear 18 screen pixels.
+        select_content_lod(
+            &order, &hidden, &present, None, &sizes, 1.0, 18.0, 16, &mut drawn,
+        );
+        assert_eq!(drawn, vec![false, true, true]);
+
+        // Zoomed out far enough, nothing is legible and every node falls back
+        // to a drawn body.
+        select_content_lod(
+            &order, &hidden, &present, None, &sizes, 0.1, 18.0, 16, &mut drawn,
+        );
+        assert_eq!(drawn, vec![false, false, false]);
+    }
+
+    #[test]
+    fn the_content_budget_binds_from_the_front_of_the_stack() {
+        let order = [0usize, 1, 2];
+        let hidden = [false, false, false];
+        let present = [true, true, true];
+        let sizes = [WorldSize::new(10.0, 40.0); 3];
+        let mut drawn = Vec::new();
+
+        select_content_lod(
+            &order, &hidden, &present, None, &sizes, 1.0, 18.0, 1, &mut drawn,
+        );
+        assert_eq!(
+            drawn,
+            vec![false, false, true],
+            "the front-most node keeps its element when the budget allows only one"
+        );
+    }
+
+    #[test]
+    fn hidden_and_culled_nodes_are_never_given_elements() {
+        let order = [0usize, 1, 2];
+        let hidden = [true, false, false];
+        let present = [true, true, false];
+        let visible = [true, false, true];
+        let sizes = [WorldSize::new(10.0, 40.0); 3];
+        let mut drawn = Vec::new();
+
+        select_content_lod(
+            &order,
+            &hidden,
+            &present,
+            Some(&visible),
+            &sizes,
+            1.0,
+            18.0,
+            16,
+            &mut drawn,
+        );
+        assert_eq!(drawn, vec![false, false, false]);
+    }
 
     #[test]
     fn only_an_edge_being_reconnected_is_hidden_from_painting() {

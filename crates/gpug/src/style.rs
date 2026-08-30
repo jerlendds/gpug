@@ -8,6 +8,29 @@ pub struct GraphStyle {
     pub edge_width_pixels: f32,
     pub hit_radius_pixels: f32,
     pub interactive_edge_budget: usize,
+    /// Smallest on-screen node height, in pixels, that still renders the
+    /// node's registered element content.
+    ///
+    /// Below this the node keeps its position, size, and colors but is drawn
+    /// from the scene columns as one batched quad. Element trees cost layout
+    /// and text shaping per node per frame; a quad costs one instance in a
+    /// buffer, and at these sizes the two are visually indistinguishable.
+    pub content_lod_min_pixels: f32,
+    /// Largest number of nodes that may render element content in one frame.
+    ///
+    /// This bounds the worst case when a viewer zooms far enough in that many
+    /// nodes clear `content_lod_min_pixels` at once.
+    pub content_budget: usize,
+    /// Shortest on-screen edge length, in pixels, that is still drawn.
+    ///
+    /// Edges shorter than this are sub-pixel scribbles between two nodes that
+    /// already overlap on screen: they cost fragment bandwidth and contribute
+    /// nothing a viewer can resolve.
+    pub edge_lod_min_pixels: f32,
+    /// Frame deadline in milliseconds that the edge level of detail is steered
+    /// to hold. `None` disables the control loop and draws whatever
+    /// `interactive_edge_budget` allows, at a fixed detail.
+    pub frame_budget_ms: Option<f32>,
 }
 
 impl Default for GraphStyle {
@@ -20,7 +43,11 @@ impl Default for GraphStyle {
             node_radius_world: 2.0,
             edge_width_pixels: 0.5,
             hit_radius_pixels: 8.0,
-            interactive_edge_budget: 100_000,
+            interactive_edge_budget: 15_000,
+            content_lod_min_pixels: 18.0,
+            content_budget: 512,
+            edge_lod_min_pixels: 2.0,
+            frame_budget_ms: Some(1_000.0 / 60.0),
         }
     }
 }
@@ -34,6 +61,10 @@ impl GraphStyle {
             finite_non_negative_or(self.edge_width_pixels, defaults.edge_width_pixels);
         self.hit_radius_pixels =
             finite_non_negative_or(self.hit_radius_pixels, defaults.hit_radius_pixels);
+        self.content_lod_min_pixels =
+            finite_non_negative_or(self.content_lod_min_pixels, defaults.content_lod_min_pixels);
+        self.edge_lod_min_pixels =
+            finite_non_negative_or(self.edge_lod_min_pixels, defaults.edge_lod_min_pixels);
         self
     }
 }

@@ -312,7 +312,7 @@ fn main() {
                     cx.new(|cx| FlowInput::new(NODE_ONE, "hello", data_api.clone(), cx));
                 let mut nodes = vec![
                     Node::new(NODE_ONE, WorldPoint::new(0.0, 0.0))
-                        .with_size(WorldSize::new(22.0, 9.0))
+                        .with_size(WorldSize::new(18.0, 9.0))
                         .with_type("text_input"),
                     Node::new(UPPERCASE, WorldPoint::new(30.0, 0.0))
                         .with_size(WorldSize::new(18.0, 8.0))
@@ -321,7 +321,7 @@ fn main() {
                         .with_size(WorldSize::new(20.0, 13.0))
                         .with_type("output_values"),
                     Node::new(NODE_TWO, WorldPoint::new(86.0, 0.0))
-                        .with_size(WorldSize::new(22.0, 13.0))
+                        .with_size(WorldSize::new(18.0, 13.0))
                         .with_type("substring_match"),
                 ];
                 nodes[0].metadata.insert("text".into(), "hello".into());

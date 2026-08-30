@@ -230,9 +230,19 @@ pub(crate) fn step_with_budget(
     budget: Duration,
 ) -> LayoutStatus {
     let started = Instant::now();
+    let mut steps = 0u32;
     loop {
         let status = layout.step(positions, edges);
-        if status.is_finished() || started.elapsed() >= budget {
+        steps += 1;
+        if status.is_finished() {
+            return status;
+        }
+        // Start another step only if one is predicted to fit in what is left.
+        // Checking whether the budget is already spent overshoots by a whole
+        // step, and on a large graph a step is milliseconds - the difference
+        // between meeting the frame deadline and missing it entirely.
+        let elapsed = started.elapsed();
+        if elapsed + elapsed / steps > budget {
             return status;
         }
     }
@@ -299,6 +309,62 @@ pub(crate) fn apply_fit(positions: &mut [WorldPoint], fit: LayoutFit) {
                 position.y = offset_y + (position.y - min_y) * scale_y;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use std::time::Duration;
+
+    struct FixedCostLayout {
+        step_cost: Duration,
+        steps: usize,
+    }
+
+    impl Layout for FixedCostLayout {
+        fn step(&mut self, _: &mut [WorldPoint], _: &[LayoutEdge]) -> LayoutStatus {
+            std::thread::sleep(self.step_cost);
+            self.steps += 1;
+            LayoutStatus::Running { energy: 1.0 }
+        }
+    }
+
+    /// A frame budget is a deadline, not a total to be exceeded once. Checking
+    /// whether the budget is already spent lets a step that has not started
+    /// run anyway, overshooting by its whole duration - which on a large graph
+    /// is milliseconds, and the difference between holding 60 fps and not.
+    #[test]
+    fn the_frame_budget_is_not_overshot_by_a_whole_step() {
+        let mut layout = FixedCostLayout {
+            step_cost: Duration::from_millis(4),
+            steps: 0,
+        };
+        let mut positions = vec![WorldPoint::ZERO; 4];
+        let started = std::time::Instant::now();
+        step_with_budget(&mut layout, &mut positions, &[], Duration::from_millis(10));
+        let elapsed = started.elapsed();
+
+        assert_eq!(layout.steps, 2, "a third 4 ms step does not fit in 10 ms");
+        assert!(
+            elapsed < Duration::from_millis(10),
+            "overshot the budget: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_finished_layout_stops_regardless_of_remaining_budget() {
+        struct DoneLayout(usize);
+        impl Layout for DoneLayout {
+            fn step(&mut self, _: &mut [WorldPoint], _: &[LayoutEdge]) -> LayoutStatus {
+                self.0 += 1;
+                LayoutStatus::Converged
+            }
+        }
+        let mut layout = DoneLayout(0);
+        let mut positions = vec![WorldPoint::ZERO; 2];
+        step_with_budget(&mut layout, &mut positions, &[], Duration::from_secs(1));
+        assert_eq!(layout.0, 1);
     }
 }
 
@@ -370,9 +436,9 @@ mod tests {
         let mut adapter = BatchLayoutAdapter::new(OffsetBatch);
         let mut positions = vec![WorldPoint::new(1.0, 2.0)];
         assert_eq!(adapter.step(&mut positions, &[]), LayoutStatus::Converged);
-        assert_eq!(positions, vec![WorldPoint::new(11.0, 22.0)]);
+        assert_eq!(positions, vec![WorldPoint::new(11.0, 18.0)]);
         assert_eq!(adapter.step(&mut positions, &[]), LayoutStatus::Converged);
-        assert_eq!(positions, vec![WorldPoint::new(11.0, 22.0)]);
+        assert_eq!(positions, vec![WorldPoint::new(11.0, 18.0)]);
     }
 
     #[test]

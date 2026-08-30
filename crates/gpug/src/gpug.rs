@@ -31,6 +31,7 @@ pub mod layout;
 pub mod node;
 pub mod node_ui;
 pub mod performance;
+pub mod profile;
 pub mod renderer;
 mod simulation;
 pub mod style;
@@ -64,4 +65,6 @@ pub use crate::input::{
 pub use crate::node_ui::{
     resize_bounds, toolbar_position, NodeResizeControl, ResizeDirection, ResizeOptions,
 };
-pub use crate::performance::{DirtySet, DirtyTracker, GeometryCache, Revisions, VisibilityIndex};
+pub use crate::performance::{
+    DetailGovernor, DirtySet, DirtyTracker, GeometryCache, Revisions, VisibilityIndex,
+};
