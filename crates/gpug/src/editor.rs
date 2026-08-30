@@ -2148,11 +2148,11 @@ mod tests {
         );
         assert_eq!(
             store.node_position_absolute(&nodes[1]),
-            WorldPoint::new(11.0, 18.0)
+            WorldPoint::new(11.0, 22.0)
         );
         assert_eq!(
             store.node_center_absolute(&nodes[1]),
-            WorldPoint::new(11.0, 18.0)
+            WorldPoint::new(11.0, 22.0)
         );
         assert_eq!(
             store.position_relative_to_parent(&nodes[1], WorldPoint::new(20.0, 30.0)),

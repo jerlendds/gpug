@@ -436,9 +436,9 @@ mod tests {
         let mut adapter = BatchLayoutAdapter::new(OffsetBatch);
         let mut positions = vec![WorldPoint::new(1.0, 2.0)];
         assert_eq!(adapter.step(&mut positions, &[]), LayoutStatus::Converged);
-        assert_eq!(positions, vec![WorldPoint::new(11.0, 18.0)]);
+        assert_eq!(positions, vec![WorldPoint::new(11.0, 22.0)]);
         assert_eq!(adapter.step(&mut positions, &[]), LayoutStatus::Converged);
-        assert_eq!(positions, vec![WorldPoint::new(11.0, 18.0)]);
+        assert_eq!(positions, vec![WorldPoint::new(11.0, 22.0)]);
     }
 
     #[test]

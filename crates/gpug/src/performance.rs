@@ -528,19 +528,51 @@ mod tests {
     fn the_governor_sheds_detail_when_frames_run_long_and_restores_it_when_they_do_not() {
         let mut governor = DetailGovernor::default();
         assert_eq!(governor.detail(), 1.0);
-        assert_eq!(governor.stride(), 1);
+        assert_eq!(governor.stride_for(100_000), 1);
 
         for _ in 0..60 {
             governor.observe(40.0, 16.7);
         }
         let shed = governor.detail();
         assert!(shed < 0.5, "detail should fall well below full: {shed}");
-        assert!(governor.stride() > 1);
+        assert!(governor.stride_for(100_000) > 1);
 
         for _ in 0..400 {
             governor.observe(8.0, 16.7);
         }
         assert_eq!(governor.detail(), 1.0, "detail returns once frames are cheap");
+    }
+
+    /// The regression this guards: a four-node flow graph was drawing one edge
+    /// in nine. Its frames were slow for reasons that had nothing to do with
+    /// its three edges, and sampling them away bought nothing at all.
+    #[test]
+    fn the_governor_never_samples_a_small_graph() {
+        let mut governor = DetailGovernor::default();
+        for _ in 0..500 {
+            governor.observe(200.0, 16.7);
+        }
+        assert!(governor.detail() < 0.5, "the loop did react to slow frames");
+
+        assert_eq!(governor.stride_for(3), 1, "a three-edge graph draws all three");
+        assert_eq!(governor.stride_for(2_047), 1);
+        assert!(governor.stride_for(100_000) > 1, "a large graph is still governed");
+    }
+
+    /// Time between two on-demand renders is not a frame time. An idle graph
+    /// must not read its own idleness as a missed deadline.
+    #[test]
+    fn relaxing_restores_full_detail() {
+        let mut governor = DetailGovernor::default();
+        for _ in 0..200 {
+            governor.observe(90.0, 16.7);
+        }
+        assert!(governor.stride_for(100_000) > 1);
+
+        governor.relax();
+        assert_eq!(governor.detail(), 1.0);
+        assert_eq!(governor.stride_for(100_000), 1);
+        assert_eq!(governor.average_ms(), 0.0);
     }
 
     #[test]
@@ -637,6 +669,15 @@ impl DetailGovernor {
     /// Never sample below one edge in twenty: past that the drawing stops
     /// describing the graph, and a frame rate bought that way is not worth it.
     const MIN_DETAIL: f32 = 0.05;
+    /// Populations below this are never sampled, however slow frames get.
+    ///
+    /// Shedding detail is only defensible when the thing being shed is
+    /// plausibly what costs the time. A few thousand edges tessellate in well
+    /// under a millisecond, so dropping any of them cannot buy a frame - it
+    /// can only remove something the viewer was looking at. When a small graph
+    /// runs slowly the cause is elsewhere, and the honest response is to draw
+    /// all of it.
+    const MIN_GOVERNED_POPULATION: usize = 2_048;
     /// Weight of the newest frame in the running average. Low enough that one
     /// slow frame does not visibly drop detail, high enough to react within a
     /// few frames of a sustained change.
@@ -674,8 +715,28 @@ impl DetailGovernor {
         self.average_ms
     }
 
-    /// Draw every nth edge to realize the current detail fraction.
-    pub fn stride(&self) -> usize {
+    /// Draw every nth edge to realize the current detail fraction, given how
+    /// many there are to draw.
+    ///
+    /// The population matters: sampling is a trade of fidelity for time, and
+    /// below a size where the fidelity being given up could buy any time, the
+    /// trade is pure loss.
+    pub fn stride_for(&self, population: usize) -> usize {
+        if population < Self::MIN_GOVERNED_POPULATION {
+            return 1;
+        }
         ((1.0 / self.detail.max(Self::MIN_DETAIL)).round() as usize).max(1)
+    }
+
+    /// Restores full detail and forgets the timing history.
+    ///
+    /// Called when the graph stops rendering continuously. A view at rest
+    /// renders only when something asks it to, so the gap between two renders
+    /// is idle time rather than a frame that ran long - feeding those gaps to
+    /// the control loop would have it shed detail precisely when there is no
+    /// deadline to hold.
+    pub fn relax(&mut self) {
+        self.average_ms = 0.0;
+        self.detail = 1.0;
     }
 }

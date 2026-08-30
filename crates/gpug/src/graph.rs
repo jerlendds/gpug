@@ -1836,6 +1836,18 @@ impl Graph {
         }
     }
 
+    /// Whether the graph is producing frames back to back, rather than
+    /// rendering once because something changed.
+    ///
+    /// This is what makes an elapsed time between renders meaningful as a
+    /// frame time, and so what makes it safe to steer level of detail from.
+    fn is_rendering_continuously(&self) -> bool {
+        self.playing
+            || self.smooth_zoom.is_some()
+            || self.pan_drag_position.is_some()
+            || self.drag_nodes.is_some()
+    }
+
     /// How long this frame's simulation may run.
     ///
     /// A force-directed layout is an anytime algorithm: more steps converge
@@ -2189,16 +2201,27 @@ impl Render for Graph {
         // draw this one at whatever detail the measurement says fits. The
         // static budget stays the ceiling; the governor only ever removes
         // more, so an application that asked for a modest budget keeps it.
+        //
+        // Only frames from a continuously rendering graph are measured. At
+        // rest the graph renders when something asks it to, so the gap between
+        // two renders is idle time, not a frame that ran long; feeding those
+        // gaps to the loop makes an untouched graph shed detail while it has
+        // nothing to keep up with.
         let governor_stride = match style.frame_budget_ms {
-            Some(target_ms) => {
+            Some(target_ms) if self.is_rendering_continuously() => {
                 let now = std::time::Instant::now();
                 if let Some(previous) = self.last_frame.replace(now) {
                     self.last_frame_ms = now.duration_since(previous).as_secs_f32() * 1_000.0;
                     self.governor.observe(self.last_frame_ms, target_ms);
                 }
-                self.governor.stride()
+                self.governor.stride_for(edges.len())
             }
-            None => 1,
+            _ => {
+                self.last_frame = None;
+                self.last_frame_ms = 0.0;
+                self.governor.relax();
+                1
+            }
         };
         let edge_stride = renderer
             .interactive_edge_stride(edges.len(), self.playing)
