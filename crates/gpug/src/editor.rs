@@ -1407,6 +1407,17 @@ impl EditorModel {
         self.emit_graph_changes(changes, edge_changes).is_ok()
     }
 
+    pub(crate) fn select_node_for_pointer(&mut self, id: NodeId, shift: bool) -> bool {
+        let already_selected = self
+            .node(id)
+            .is_some_and(|node| self.store.node_selected(node));
+        if shift || !already_selected {
+            self.select_node(id, shift, shift)
+        } else {
+            true
+        }
+    }
+
     pub fn select_edge(&mut self, id: EdgeId, multi: bool, toggle: bool) -> bool {
         let node_changes = if multi {
             Vec::new()
@@ -2203,6 +2214,20 @@ mod tests {
         model.replace_external(nodes, vec![]).unwrap();
         assert!(model.store.node_selected(&model.nodes[0]));
         assert!(!model.store.node_selected(&model.nodes[1]));
+    }
+
+    #[test]
+    fn pointer_down_on_selected_node_preserves_group_for_drag() {
+        let mut first = Node::new(1u64, WorldPoint::ZERO);
+        first.selected = true;
+        let mut second = Node::new(2u64, WorldPoint::new(20.0, 0.0));
+        second.selected = true;
+        let mut model =
+            EditorModel::new(vec![first, second], vec![], GraphOwnership::Internal).unwrap();
+
+        assert!(model.select_node_for_pointer(NodeId(1), false));
+        assert!(model.store.node_selected(&model.nodes[0]));
+        assert!(model.store.node_selected(&model.nodes[1]));
     }
 
     #[test]

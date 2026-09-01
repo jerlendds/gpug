@@ -78,6 +78,7 @@ const RECONNECT_HANDLE_SIZE_WORLD: f32 = 0.9;
 /// flat fill. Corner rounding and a one-pixel border are both sub-pixel below
 /// this, so the shaped quad costs shader work that resolves to nothing.
 const SHELL_LOD_MIN_PIXELS: f32 = 5.0;
+const MULTI_SELECTION_PADDING_PIXELS: f32 = 6.0;
 
 /// Edge type resolved once per membership change. Comparing a copyable tag per
 /// frame beats re-reading and re-hashing every edge's type string.
@@ -1207,6 +1208,82 @@ impl Graph {
         node.allows_drag_at(local)
     }
 
+    fn multi_selection_contains_screen_position(&self, position: Point<Pixels>) -> bool {
+        let Some(bounds) = selected_node_bounds(
+            &self.scene.selected,
+            &self.scene.positions,
+            &self.scene.node_sizes,
+            &self.scene.hidden,
+        ) else {
+            return false;
+        };
+        let top_left = self.viewport.world_to_screen(bounds.origin);
+        let bottom_right = self.viewport.world_to_screen(WorldPoint::new(
+            bounds.origin.x + bounds.size.width,
+            bounds.origin.y + bounds.size.height,
+        ));
+        let padding = px(MULTI_SELECTION_PADDING_PIXELS);
+        position.x >= top_left.x - padding
+            && position.x <= bottom_right.x + padding
+            && position.y >= top_left.y - padding
+            && position.y <= bottom_right.y + padding
+    }
+
+    fn begin_selected_node_drag(&mut self, position: Point<Pixels>, gesture_node: NodeId) -> bool {
+        let world = self.screen_to_world(position);
+        let items = self
+            .model
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| self.model.store.node_selected(node) && node.draggable)
+            .map(|(index, node)| {
+                let absolute = self.model.store.node_position_absolute(node);
+                (
+                    index,
+                    WorldPoint::new(world.x - absolute.x, world.y - absolute.y),
+                )
+            })
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            return false;
+        }
+        let affected = items
+            .iter()
+            .map(|(index, _)| self.model.nodes[*index].id)
+            .collect();
+        self.drag_nodes = Some(items);
+        self.pointer = Some(PointerController::begin(
+            ViewportPoint::new(position.x / px(1.0), position.y / px(1.0)),
+            self.gestures.drag_threshold,
+            affected,
+        ));
+        self.gestures.claim(
+            GestureOwner::NodeDrag,
+            Gesture::NodeDrag {
+                node: gesture_node,
+                pointer_offset: WorldPoint::ZERO,
+            },
+        );
+        true
+    }
+
+    fn begin_multi_selection_drag(&mut self, position: Point<Pixels>) -> bool {
+        if !self.multi_selection_contains_screen_position(position) {
+            return false;
+        }
+        let Some(node) = self
+            .model
+            .nodes
+            .iter()
+            .find(|node| self.model.store.node_selected(node) && node.draggable)
+            .map(|node| node.id)
+        else {
+            return false;
+        };
+        self.begin_selected_node_drag(position, node)
+    }
+
     fn handle_at_screen_position(
         &self,
         position: Point<Pixels>,
@@ -2101,6 +2178,49 @@ fn world_bounds(nodes: &[Node], store: &EditorStore) -> Option<WorldBounds> {
     ))
 }
 
+fn selected_node_bounds(
+    selected: &[usize],
+    positions: &[WorldPoint],
+    sizes: &[crate::WorldSize],
+    hidden: &[bool],
+) -> Option<WorldBounds> {
+    if selected.len() < 2 {
+        return None;
+    }
+    let mut bounds = selected
+        .iter()
+        .copied()
+        .filter(|&index| !hidden[index])
+        .map(|index| {
+            let position = positions[index];
+            let size = sizes[index];
+            WorldBounds::new(
+                WorldPoint::new(
+                    position.x - size.width * 0.5,
+                    position.y - size.height * 0.5,
+                ),
+                size,
+            )
+        });
+    let first = bounds.next()?;
+    let second = bounds.next()?;
+    let (mut min_x, mut min_y) = (first.origin.x, first.origin.y);
+    let (mut max_x, mut max_y) = (
+        first.origin.x + first.size.width,
+        first.origin.y + first.size.height,
+    );
+    for bounds in std::iter::once(second).chain(bounds) {
+        min_x = min_x.min(bounds.origin.x);
+        min_y = min_y.min(bounds.origin.y);
+        max_x = max_x.max(bounds.origin.x + bounds.size.width);
+        max_y = max_y.max(bounds.origin.y + bounds.size.height);
+    }
+    Some(WorldBounds::new(
+        WorldPoint::new(min_x, min_y),
+        crate::WorldSize::new(max_x - min_x, max_y - min_y),
+    ))
+}
+
 impl Render for Graph {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _frame = profile::scope(Phase::Render);
@@ -2197,6 +2317,7 @@ impl Render for Graph {
         let resize_control_colors = self.scene.resize_control_colors.clone();
         let selected_edges = self.scene.selected_edges.clone();
         let edges = self.layout_edges.clone();
+        let multi_selection = selected_node_bounds(&selected, &positions, &node_sizes, &hidden);
         // Fold the frame that just elapsed into the detail control loop, then
         // draw this one at whatever detail the measurement says fits. The
         // static budget stays the ceiling; the governor only ever removes
@@ -3034,6 +3155,28 @@ impl Render for Graph {
                             }
                         }
                     }
+                    if let Some(selection) = multi_selection {
+                        let top_left = viewport.world_to_screen(selection.origin);
+                        let bottom_right = viewport.world_to_screen(WorldPoint::new(
+                            selection.origin.x + selection.size.width,
+                            selection.origin.y + selection.size.height,
+                        ));
+                        let padding = px(MULTI_SELECTION_PADDING_PIXELS);
+                        let rectangle = Bounds::new(
+                            point(top_left.x - padding, top_left.y - padding),
+                            size(
+                                bottom_right.x - top_left.x + padding * 2.0,
+                                bottom_right.y - top_left.y + padding * 2.0,
+                            ),
+                        );
+                        window
+                            .paint_quad(fill(rectangle, rgba((style.selection_color << 8) | 0x18)));
+                        window.paint_quad(outline(
+                            rectangle,
+                            rgba((style.selection_color << 8) | 0xc0),
+                            BorderStyle::default(),
+                        ));
+                    }
                     if let Some((start, end)) = marquee {
                         let origin = point(start.x.min(end.x), start.y.min(end.y));
                         let rectangle = Bounds::new(
@@ -3250,7 +3393,7 @@ impl Render for Graph {
                         let id = graph.model.nodes[index].id;
                         graph
                             .model
-                            .select_node(id, event.modifiers.shift, event.modifiers.shift);
+                            .select_node_for_pointer(id, event.modifiers.shift);
                         if !graph.model.store.node_selected(&graph.model.nodes[index]) {
                             graph.flush();
                             cx.notify();
@@ -3264,48 +3407,11 @@ impl Render for Graph {
                             cx.notify();
                             return;
                         }
-                        let world = graph.screen_to_world(event.position);
-                        graph.drag_nodes = Some(
-                            graph
-                                .model
-                                .nodes
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, node)| {
-                                    graph.model.store.node_selected(node) && node.draggable
-                                })
-                                .map(|(index, node)| {
-                                    (index, {
-                                        let absolute =
-                                            graph.model.store.node_position_absolute(node);
-                                        WorldPoint::new(world.x - absolute.x, world.y - absolute.y)
-                                    })
-                                })
-                                .collect(),
-                        );
-                        let affected = graph
-                            .drag_nodes
-                            .as_ref()
-                            .into_iter()
-                            .flatten()
-                            .map(|(index, _)| graph.model.nodes[*index].id)
-                            .collect();
-                        graph.pointer = Some(PointerController::begin(
-                            ViewportPoint::new(
-                                event.position.x / px(1.0),
-                                event.position.y / px(1.0),
-                            ),
-                            graph.gestures.drag_threshold,
-                            affected,
-                        ));
-                        let node = &graph.model.nodes[index];
-                        graph.gestures.claim(
-                            GestureOwner::NodeDrag,
-                            Gesture::NodeDrag {
-                                node: node.id,
-                                pointer_offset: WorldPoint::ZERO,
-                            },
-                        );
+                        graph.begin_selected_node_drag(event.position, id);
+                    } else if !event.modifiers.shift
+                        && graph.begin_multi_selection_drag(event.position)
+                    {
+                        graph.announce("Dragging selection");
                     } else if let Some(index) = graph.edge_index_at_screen_position(event.position)
                     {
                         let id = graph.model.edges[index].id;
@@ -3572,7 +3678,7 @@ impl Render for Graph {
 
 #[cfg(test)]
 mod tests {
-    use super::{reconnecting_edge_id, select_content_lod, GraphDataApi};
+    use super::{reconnecting_edge_id, select_content_lod, selected_node_bounds, GraphDataApi};
     use crate::WorldSize;
     use crate::{
         ConnectionIntent, ConnectionState, Edge, EdgeId, HandleKey, HandleKind, Node, NodeId,
@@ -3648,6 +3754,26 @@ mod tests {
             &mut drawn,
         );
         assert_eq!(drawn, vec![false, false, false]);
+    }
+
+    #[test]
+    fn multiple_selected_nodes_get_one_union_bounds() {
+        let positions = [
+            WorldPoint::new(10.0, 10.0),
+            WorldPoint::new(30.0, 20.0),
+            WorldPoint::new(100.0, 100.0),
+        ];
+        let sizes = [
+            WorldSize::new(10.0, 8.0),
+            WorldSize::new(6.0, 20.0),
+            WorldSize::new(50.0, 50.0),
+        ];
+
+        let bounds = selected_node_bounds(&[0, 1], &positions, &sizes, &[false; 3]).unwrap();
+        assert_eq!(bounds.origin, WorldPoint::new(5.0, 6.0));
+        assert_eq!(bounds.size, WorldSize::new(28.0, 24.0));
+        assert!(selected_node_bounds(&[0], &positions, &sizes, &[false; 3]).is_none());
+        assert!(selected_node_bounds(&[0, 1], &positions, &sizes, &[false, true, false]).is_none());
     }
 
     #[test]
