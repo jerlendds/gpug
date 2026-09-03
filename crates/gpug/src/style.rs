@@ -41,7 +41,7 @@ impl Default for GraphStyle {
             edge_color: 0x323232,
             selection_color: 0x1E90FF,
             node_radius_world: 2.0,
-            edge_width_pixels: 0.5,
+            edge_width_pixels: 2.0,
             hit_radius_pixels: 8.0,
             interactive_edge_budget: 15_000,
             content_lod_min_pixels: 18.0,
@@ -95,5 +95,10 @@ mod tests {
         assert_eq!(style.node_radius_world, defaults.node_radius_world);
         assert_eq!(style.edge_width_pixels, defaults.edge_width_pixels);
         assert_eq!(style.hit_radius_pixels, defaults.hit_radius_pixels);
+    }
+
+    #[test]
+    fn default_edges_are_two_pixels_wide() {
+        assert_eq!(GraphStyle::default().edge_width_pixels, 2.0);
     }
 }

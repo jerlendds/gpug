@@ -8,6 +8,12 @@ GPUG uses three intentionally distinct coordinate spaces.
 | World | `WorldPoint`, `WorldSize`, `WorldBounds` | `f32` | Authoritative graph geometry |
 | Screen | GPUI `Point<Pixels>` | GPUI pixels | Painting and pointer events |
 
+`Graph::world_to_screen` and `Graph::screen_to_world` use GPUI window
+coordinates. GPUG accounts for the graph component's laid-out origin, so the
+same pointer position can be passed directly when the graph is nested beside a
+sidebar, header, or other content. `Viewport` transforms remain local to the
+graph pane.
+
 The graph stores only world positions. Pan and zoom live in `Viewport` and are
 never passed to a layout engine:
 

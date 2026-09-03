@@ -337,6 +337,12 @@ pub fn smooth_step_path(
     b_side: Position,
     step: f32,
 ) -> (Vec<WorldPoint>, WorldPoint) {
+    let distance = (b.x - a.x).abs() + (b.y - a.y).abs();
+    let step = if step.is_finite() {
+        step.max(0.0).min(distance * 0.25)
+    } else {
+        0.0
+    };
     let start = match a_side {
         Position::Left => WorldPoint::new(a.x - step, a.y),
         Position::Right => WorldPoint::new(a.x + step, a.y),
@@ -350,21 +356,97 @@ pub fn smooth_step_path(
         Position::Bottom => WorldPoint::new(b.x, b.y + step),
     };
     let center = WorldPoint::new((start.x + end.x) * 0.5, (start.y + end.y) * 0.5);
-    let mut points = vec![a, start];
+    let mut corners = vec![a, start];
     if matches!(a_side, Position::Left | Position::Right) {
-        points.push(WorldPoint::new(center.x, start.y));
-        points.push(WorldPoint::new(center.x, end.y))
+        corners.push(WorldPoint::new(center.x, start.y));
+        corners.push(WorldPoint::new(center.x, end.y))
     } else {
-        points.push(WorldPoint::new(start.x, center.y));
-        points.push(WorldPoint::new(end.x, center.y))
+        corners.push(WorldPoint::new(start.x, center.y));
+        corners.push(WorldPoint::new(end.x, center.y))
     }
-    points.extend([end, b]);
+    corners.extend([end, b]);
+    corners.dedup_by(|a, b| (a.x - b.x).abs() < 0.0001 && (a.y - b.y).abs() < 0.0001);
+    let mut simplified: Vec<WorldPoint> = Vec::with_capacity(corners.len());
+    for point in corners {
+        while simplified.len() >= 2 {
+            let a = simplified[simplified.len() - 2];
+            let b = simplified[simplified.len() - 1];
+            let cross = (b.x - a.x) * (point.y - b.y) - (b.y - a.y) * (point.x - b.x);
+            if cross.abs() >= 0.0001 {
+                break;
+            }
+            simplified.pop();
+        }
+        simplified.push(point);
+    }
+    let corners = simplified;
+
+    let mut points = Vec::with_capacity(corners.len() * 4);
+    points.push(corners[0]);
+    for window in corners.windows(3) {
+        let [previous, corner, next] = [window[0], window[1], window[2]];
+        let incoming = WorldPoint::new(previous.x - corner.x, previous.y - corner.y);
+        let outgoing = WorldPoint::new(next.x - corner.x, next.y - corner.y);
+        let incoming_length = (incoming.x * incoming.x + incoming.y * incoming.y).sqrt();
+        let outgoing_length = (outgoing.x * outgoing.x + outgoing.y * outgoing.y).sqrt();
+        if incoming_length <= 0.0001 || outgoing_length <= 0.0001 {
+            continue;
+        }
+        let radius = (step * 0.5)
+            .min(incoming_length * 0.5)
+            .min(outgoing_length * 0.5);
+        let before = WorldPoint::new(
+            corner.x + incoming.x / incoming_length * radius,
+            corner.y + incoming.y / incoming_length * radius,
+        );
+        let after = WorldPoint::new(
+            corner.x + outgoing.x / outgoing_length * radius,
+            corner.y + outgoing.y / outgoing_length * radius,
+        );
+        points.push(before);
+        for sample in 1..=4 {
+            let t = sample as f32 / 4.0;
+            let u = 1.0 - t;
+            points.push(WorldPoint::new(
+                u * u * before.x + 2.0 * u * t * corner.x + t * t * after.x,
+                u * u * before.y + 2.0 * u * t * corner.y + t * t * after.y,
+            ));
+        }
+    }
+    points.push(*corners.last().expect("a route always has endpoints"));
     (points, center)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smooth_step_clamps_clearance_and_rounds_corners() {
+        let a = WorldPoint::new(0.0, 0.0);
+        let b = WorldPoint::new(10.0, 8.0);
+        let (points, _) = smooth_step_path(a, Position::Right, b, Position::Left, 20.0);
+
+        assert_eq!(points.first(), Some(&a));
+        assert_eq!(points.last(), Some(&b));
+        assert!(points.iter().all(|point| point.x >= 0.0 && point.x <= 10.0));
+        assert!(points.len() > 6, "rounded corners are sampled");
+    }
+
+    #[test]
+    fn smooth_step_sanitizes_non_finite_clearance() {
+        let (points, _) = smooth_step_path(
+            WorldPoint::new(0.0, 0.0),
+            Position::Right,
+            WorldPoint::new(10.0, 0.0),
+            Position::Left,
+            f32::NAN,
+        );
+        assert!(points
+            .iter()
+            .all(|point| point.x.is_finite() && point.y.is_finite()));
+    }
+
     #[test]
     fn strict_mode_accepts_reverse_origin_but_not_equal_kinds() {
         let c = connection(NodeId(1), NodeId(2));

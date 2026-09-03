@@ -402,4 +402,15 @@ mod tests {
             ViewportPoint::new(100.0, 100.0)
         );
     }
+
+    #[test]
+    fn auto_pan_edges_produce_distinct_cardinal_directions() {
+        let viewport = Viewport::default();
+        let pane = WorldSize::new(100.0, 80.0);
+        let delta = |x, y| viewport.auto_pan_delta(ViewportPoint::new(x, y), pane, 10.0, 2.0);
+        assert_eq!(delta(0.0, 40.0), ViewportPoint::new(2.0, 0.0));
+        assert_eq!(delta(100.0, 40.0), ViewportPoint::new(-2.0, 0.0));
+        assert_eq!(delta(50.0, 0.0), ViewportPoint::new(0.0, 2.0));
+        assert_eq!(delta(50.0, 80.0), ViewportPoint::new(0.0, -2.0));
+    }
 }

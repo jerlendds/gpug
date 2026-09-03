@@ -412,7 +412,12 @@ mod tests {
         for (index, (x, y, width, height)) in bounds.iter().enumerate() {
             let node = Node::new(index as u64 + 1, WorldPoint::new(*x, *y))
                 .with_size(WorldSize::new(*width, *height));
-            columns.push_for_test(&node, WorldPoint::new(*x, *y), WorldSize::new(*width, *height), NO_PARENT);
+            columns.push_for_test(
+                &node,
+                WorldPoint::new(*x, *y),
+                WorldSize::new(*width, *height),
+                NO_PARENT,
+            );
         }
         columns.touch();
         columns
@@ -454,9 +459,18 @@ mod tests {
         let mut index = VisibilityIndex::default();
         let (mut visible, mut flags) = (Vec::new(), Vec::new());
         for camera in [
-            WorldBounds::new(WorldPoint::new(-100.0, -100.0), WorldSize::new(200.0, 200.0)),
-            WorldBounds::new(WorldPoint::new(2_000.0, -4_000.0), WorldSize::new(900.0, 500.0)),
-            WorldBounds::new(WorldPoint::new(-9_000.0, -9_000.0), WorldSize::new(50.0, 50.0)),
+            WorldBounds::new(
+                WorldPoint::new(-100.0, -100.0),
+                WorldSize::new(200.0, 200.0),
+            ),
+            WorldBounds::new(
+                WorldPoint::new(2_000.0, -4_000.0),
+                WorldSize::new(900.0, 500.0),
+            ),
+            WorldBounds::new(
+                WorldPoint::new(-9_000.0, -9_000.0),
+                WorldSize::new(50.0, 50.0),
+            ),
             WorldBounds::new(
                 WorldPoint::new(-6_000.0, -6_000.0),
                 WorldSize::new(12_000.0, 12_000.0),
@@ -477,7 +491,12 @@ mod tests {
     fn a_query_finds_every_node_under_a_point() {
         let mut bounds = Vec::new();
         for index in 0..2_000 {
-            bounds.push(((index % 40) as f32 * 25.0, (index / 40) as f32 * 25.0, 10.0, 10.0));
+            bounds.push((
+                (index % 40) as f32 * 25.0,
+                (index / 40) as f32 * 25.0,
+                10.0,
+                10.0,
+            ));
         }
         // Two overlapping nodes sit on the same spot as node 0.
         bounds.push((0.0, 0.0, 10.0, 10.0));
@@ -521,7 +540,10 @@ mod tests {
 
         columns.set_position(0, WorldPoint::new(9_000.0, 9_000.0));
         index.query(&columns, at_origin, &mut hits);
-        assert!(hits.is_empty(), "a moved node is not reported at its old place");
+        assert!(
+            hits.is_empty(),
+            "a moved node is not reported at its old place"
+        );
     }
 
     #[test]
@@ -540,7 +562,11 @@ mod tests {
         for _ in 0..400 {
             governor.observe(8.0, 16.7);
         }
-        assert_eq!(governor.detail(), 1.0, "detail returns once frames are cheap");
+        assert_eq!(
+            governor.detail(),
+            1.0,
+            "detail returns once frames are cheap"
+        );
     }
 
     /// The regression this guards: a four-node flow graph was drawing one edge
@@ -554,9 +580,16 @@ mod tests {
         }
         assert!(governor.detail() < 0.5, "the loop did react to slow frames");
 
-        assert_eq!(governor.stride_for(3), 1, "a three-edge graph draws all three");
+        assert_eq!(
+            governor.stride_for(3),
+            1,
+            "a three-edge graph draws all three"
+        );
         assert_eq!(governor.stride_for(2_047), 1);
-        assert!(governor.stride_for(100_000) > 1, "a large graph is still governed");
+        assert!(
+            governor.stride_for(100_000) > 1,
+            "a large graph is still governed"
+        );
     }
 
     /// Time between two on-demand renders is not a frame time. An idle graph
@@ -581,7 +614,10 @@ mod tests {
         for _ in 0..10_000 {
             governor.observe(500.0, 16.7);
         }
-        assert!(governor.detail() >= 0.05, "a floor keeps the drawing legible");
+        assert!(
+            governor.detail() >= 0.05,
+            "a floor keeps the drawing legible"
+        );
 
         let steady = governor.detail();
         governor.observe(f32::NAN, 16.7);

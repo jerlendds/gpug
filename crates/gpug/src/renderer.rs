@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use gpui::AnyElement;
 
 use crate::{
-    Diagnostic, Edge, EdgeId, GraphStyle, Node, NodeId, NodeRuntime, SharedDiagnosticSink,
-    WorldPoint, WorldSize,
+    Diagnostic, Edge, EdgeId, GraphStyle, HandleKey, Node, NodeId, NodeRuntime,
+    SharedDiagnosticSink, WorldPoint, WorldSize,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -72,6 +72,66 @@ pub struct EdgeAppearance {
     pub width_pixels: f32,
 }
 
+/// Coordinates available to a custom edge path renderer.
+///
+/// Returned points are interpreted in world space and must include the start
+/// and end of the path. GPUG continues to own painting, selection, hit testing,
+/// markers, and viewport transforms.
+pub struct EdgePathContext<'a> {
+    pub edge: &'a Edge,
+    pub source: WorldPoint,
+    pub target: WorldPoint,
+}
+
+pub trait EdgePathRenderer: Send + Sync {
+    fn path(&self, context: &EdgePathContext<'_>) -> Vec<WorldPoint>;
+}
+
+impl<F> EdgePathRenderer for F
+where
+    F: Fn(&EdgePathContext<'_>) -> Vec<WorldPoint> + Send + Sync,
+{
+    fn path(&self, context: &EdgePathContext<'_>) -> Vec<WorldPoint> {
+        self(context)
+    }
+}
+
+/// The information available while styling the edge preview created by a
+/// connection gesture. Coordinates deliberately live outside this context:
+/// the graph owns geometry and snapping, while the renderer owns presentation.
+pub struct ConnectionLineContext<'a> {
+    pub from: &'a HandleKey,
+    /// `None` means the pointer is not currently over a handle, `Some(true)`
+    /// is a valid snap target, and `Some(false)` is a rejected target.
+    pub valid: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConnectionLineAppearance {
+    pub color: u32,
+    pub width_pixels: f32,
+    /// Length of each dash in pixels. Zero paints a continuous line.
+    pub dash_pixels: f32,
+    pub gap_pixels: f32,
+    /// Radius of the pointer-end ring. Zero omits it.
+    pub end_radius_pixels: f32,
+    /// Pulls the line vertically out of each endpoint before it bends across.
+    pub bend_pixels: f32,
+}
+
+pub trait ConnectionLineRenderer: Send + Sync {
+    fn appearance(&self, context: &ConnectionLineContext<'_>) -> ConnectionLineAppearance;
+}
+
+impl<F> ConnectionLineRenderer for F
+where
+    F: Fn(&ConnectionLineContext<'_>) -> ConnectionLineAppearance + Send + Sync,
+{
+    fn appearance(&self, context: &ConnectionLineContext<'_>) -> ConnectionLineAppearance {
+        self(context)
+    }
+}
+
 pub trait NodeTypeRenderer: Send + Sync {
     fn appearance(&self, node: &Node, zoom: f32, style: &GraphStyle) -> NodeAppearance;
 }
@@ -103,6 +163,8 @@ pub struct GraphRenderer {
     node_contents: Arc<HashMap<String, Arc<dyn NodeContentRenderer>>>,
     cached_node_contents: Arc<HashSet<String>>,
     edge_types: Arc<HashMap<String, Arc<dyn EdgeTypeRenderer>>>,
+    edge_paths: Arc<HashMap<String, Arc<dyn EdgePathRenderer>>>,
+    connection_line: Option<Arc<dyn ConnectionLineRenderer>>,
     diagnostics: Option<SharedDiagnosticSink>,
     reported: Arc<Mutex<HashSet<String>>>,
 }
@@ -126,6 +188,7 @@ impl fmt::Debug for GraphRenderer {
             .field("style", &self.style)
             .field("node_types", &self.node_types.keys())
             .field("edge_types", &self.edge_types.keys())
+            .field("edge_paths", &self.edge_paths.keys())
             .field("diagnostics", &self.diagnostics.is_some())
             .finish()
     }
@@ -226,6 +289,73 @@ impl GraphRenderer {
         renderer: impl EdgeTypeRenderer + 'static,
     ) {
         Arc::make_mut(&mut self.edge_types).insert(name.into(), Arc::new(renderer));
+    }
+    /// Registers custom routing for an edge type. A route with fewer than two
+    /// points is ignored and falls back to a straight edge.
+    pub fn register_edge_path(
+        &mut self,
+        name: impl Into<String>,
+        renderer: impl EdgePathRenderer + 'static,
+    ) {
+        Arc::make_mut(&mut self.edge_paths).insert(name.into(), Arc::new(renderer));
+    }
+
+    pub(crate) fn edge_path(
+        &self,
+        edge: &Edge,
+        source: WorldPoint,
+        target: WorldPoint,
+    ) -> Option<Vec<WorldPoint>> {
+        self.edge_paths.get(&edge.edge_type).and_then(|renderer| {
+            let path = renderer.path(&EdgePathContext {
+                edge,
+                source,
+                target,
+            });
+            (path.len() >= 2).then_some(path)
+        })
+    }
+    /// Replaces the standard connection gesture preview without changing
+    /// hit-testing, validation, or handle snapping.
+    pub fn set_connection_line_renderer(
+        &mut self,
+        renderer: impl ConnectionLineRenderer + 'static,
+    ) {
+        self.connection_line = Some(Arc::new(renderer));
+    }
+
+    pub fn connection_line_appearance(
+        &self,
+        context: &ConnectionLineContext<'_>,
+    ) -> ConnectionLineAppearance {
+        let fallback = ConnectionLineAppearance {
+            color: if context.valid == Some(false) {
+                0xd14343
+            } else {
+                0x1e90ff
+            },
+            width_pixels: 3.0,
+            dash_pixels: 0.0,
+            gap_pixels: 0.0,
+            end_radius_pixels: 0.0,
+            bend_pixels: 0.0,
+        };
+        let mut appearance = self
+            .connection_line
+            .as_ref()
+            .map_or(fallback, |renderer| renderer.appearance(context));
+        appearance.width_pixels =
+            crate::style::finite_non_negative_or(appearance.width_pixels, 3.0);
+        appearance.dash_pixels = crate::style::finite_non_negative_or(appearance.dash_pixels, 0.0);
+        appearance.gap_pixels = crate::style::finite_non_negative_or(appearance.gap_pixels, 0.0);
+        appearance.end_radius_pixels =
+            crate::style::finite_non_negative_or(appearance.end_radius_pixels, 0.0);
+        appearance.bend_pixels = if appearance.bend_pixels.is_finite() {
+            appearance.bend_pixels
+        } else {
+            0.0
+        };
+        appearance
     }
     pub fn node_appearance(&self, node: &Node, zoom: f32) -> NodeAppearance {
         if !matches!(

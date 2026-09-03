@@ -13,8 +13,10 @@ pub use crate::layout::{
 };
 pub use crate::node::{Node, NodeId};
 pub use crate::renderer::{
-    EdgeAppearance, EdgePaintContext, EdgeTypeRenderer, EditorAction, GraphRenderer,
-    NodeAppearance, NodeContentRenderer, NodeRenderContext, NodeShape, NodeTypeRenderer,
+    ConnectionLineAppearance, ConnectionLineContext, ConnectionLineRenderer, EdgeAppearance,
+    EdgePaintContext, EdgePathContext, EdgePathRenderer, EdgeTypeRenderer, EditorAction,
+    GraphRenderer, NodeAppearance, NodeContentRenderer, NodeRenderContext, NodeShape,
+    NodeTypeRenderer,
 };
 pub use crate::style::GraphStyle;
 pub mod connection;

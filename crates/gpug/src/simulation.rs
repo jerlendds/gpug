@@ -501,8 +501,12 @@ mod tests {
     /// whatever view was framing it.
     #[test]
     fn gravity_pulls_inward_without_translating_the_graph() {
-        let mut xs: Vec<f32> = (0..64).map(|index| 9_000.0 + (index % 8) as f32 * 10.0).collect();
-        let mut ys: Vec<f32> = (0..64).map(|index| -4_000.0 + (index / 8) as f32 * 10.0).collect();
+        let mut xs: Vec<f32> = (0..64)
+            .map(|index| 9_000.0 + (index % 8) as f32 * 10.0)
+            .collect();
+        let mut ys: Vec<f32> = (0..64)
+            .map(|index| -4_000.0 + (index / 8) as f32 * 10.0)
+            .collect();
         let centroid = |xs: &[f32], ys: &[f32]| {
             (
                 xs.iter().sum::<f32>() / xs.len() as f32,

@@ -25,8 +25,11 @@ fn allocate_edge_id() -> EdgeId {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum EdgeMarker {
+    /// An open arrowhead.
     Arrow,
+    /// A filled arrowhead.
     ArrowClosed,
+    /// A marker name reserved for host-defined marker integrations.
     Custom(String),
 }
 
@@ -86,9 +89,25 @@ impl Edge {
             focusable: true,
             label: None,
             marker_start: None,
-            marker_end: None,
+            marker_end: Some(EdgeMarker::ArrowClosed),
             metadata: HashMap::new(),
         }
+    }
+
+    /// Sets the marker painted at the source end of the edge.
+    ///
+    /// Pass `None` to paint no source marker.
+    pub fn with_marker_start(mut self, marker: Option<EdgeMarker>) -> Self {
+        self.marker_start = marker;
+        self
+    }
+
+    /// Sets the marker painted at the target end of the edge.
+    ///
+    /// Edges default to [`EdgeMarker::ArrowClosed`]. Pass `None` to opt out.
+    pub fn with_marker_end(mut self, marker: Option<EdgeMarker>) -> Self {
+        self.marker_end = marker;
+        self
     }
     pub fn with_id(mut self, id: impl Into<u64>) -> Self {
         self.id = EdgeId(id.into());
@@ -146,5 +165,18 @@ mod tests {
 
         assert_eq!(edge.id, EdgeId(42));
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn edges_are_directed_by_default_and_markers_can_be_overridden() {
+        let edge = Edge::new(1u64, 2u64);
+        assert_eq!(edge.marker_start, None);
+        assert_eq!(edge.marker_end, Some(EdgeMarker::ArrowClosed));
+
+        let edge = edge
+            .with_marker_start(Some(EdgeMarker::Arrow))
+            .with_marker_end(None);
+        assert_eq!(edge.marker_start, Some(EdgeMarker::Arrow));
+        assert_eq!(edge.marker_end, None);
     }
 }
