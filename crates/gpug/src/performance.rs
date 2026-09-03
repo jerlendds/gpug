@@ -111,6 +111,10 @@ pub struct GeometryCache<G> {
     entries: HashMap<EdgeId, CacheEntry<G>>,
 }
 impl<G: Clone> GeometryCache<G> {
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     pub fn get_or_insert_with(
         &mut self,
         id: EdgeId,

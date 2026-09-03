@@ -5,6 +5,10 @@ pub struct GraphStyle {
     pub edge_color: u32,
     pub selection_color: u32,
     pub node_radius_world: f32,
+    /// Default rendered edge width in screen pixels.
+    ///
+    /// The built-in default is `2.0`. Applications may override this globally
+    /// or return a different width from a registered edge-type renderer.
     pub edge_width_pixels: f32,
     pub hit_radius_pixels: f32,
     pub interactive_edge_budget: usize,

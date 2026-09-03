@@ -127,13 +127,28 @@ impl Graph {
         self.viewport.set_zoom(zoom);
     }
 
+    /// Changes the maximum viewport scale and clamps the current zoom if needed.
+    ///
+    /// The value is measured in screen pixels per world unit. Non-finite values
+    /// and values below [`Viewport::MIN_ZOOM`] are ignored.
+    pub fn set_max_zoom(&mut self, max_zoom: f32) {
+        let previous = self.viewport;
+        self.viewport.set_max_zoom(max_zoom);
+        if self.viewport == previous {
+            return;
+        }
+        self.smooth_zoom = None;
+        self.events.push(GraphEvent::ViewportChanged(self.viewport));
+        self.model.store.dirty.mark_viewport();
+    }
+
     pub(super) fn queue_smooth_zoom(&mut self, factor: f32, anchor: Point<Pixels>) {
         let anchor = self.local_screen(anchor);
         let base = self
             .smooth_zoom
             .map_or(self.viewport.zoom(), |zoom| zoom.target);
         self.smooth_zoom = Some(SmoothZoom {
-            target: (base * factor).clamp(Viewport::MIN_ZOOM, Viewport::MAX_ZOOM),
+            target: (base * factor).clamp(Viewport::MIN_ZOOM, self.viewport.max_zoom()),
             anchor,
         });
     }

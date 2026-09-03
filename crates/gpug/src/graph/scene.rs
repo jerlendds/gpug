@@ -24,7 +24,8 @@ impl Graph {
                 .scene
                 .edge_kinds
                 .iter()
-                .any(|kind| *kind != EdgeKind::Straight);
+                .zip(self.model.edges.iter())
+                .any(|(kind, edge)| *kind != EdgeKind::Straight || edge.source == edge.target);
             self.scene.any_edge_labels = self.model.edges.iter().any(|edge| edge.label.is_some());
             self.scene.edge_ids = self.model.edges.iter().map(|edge| edge.id).collect();
             self.scene.edge_markers = self
@@ -76,8 +77,14 @@ impl Graph {
             self.content_present = present;
         }
 
-        let motion = (membership, revisions.nodes, revisions.edges);
+        // Fixed-pixel node shapes change their world-space connection extent
+        // with zoom, so edge endpoints must refresh with the viewport scale.
+        let motion = (membership, revisions.nodes, revisions.edges, zoom.to_bits());
         if self.scene.motion != Some(motion) {
+            let zoom_changed = self
+                .scene
+                .motion
+                .is_some_and(|(_, _, _, previous_zoom)| previous_zoom != zoom.to_bits());
             let _scope = profile::scope(Phase::SceneMotion);
             self.scene.motion = Some(motion);
             let mut positions_buffer = std::mem::take(&mut self.scene.positions);
@@ -91,6 +98,9 @@ impl Graph {
             let positions = self.scene.positions.clone();
             let kinds = self.scene.edge_kinds.clone();
             let mut cache = std::mem::take(&mut self.edge_geometry_cache);
+            if zoom_changed {
+                cache.clear();
+            }
             let mut geometry_buffer = std::mem::take(&mut self.scene.edge_geometries);
             let geometries = Rc::make_mut(&mut geometry_buffer);
             geometries.clear();
@@ -111,7 +121,7 @@ impl Graph {
                     .enumerate()
                 {
                     let kind = kinds.get(index).copied().unwrap_or(EdgeKind::Straight);
-                    if kind == EdgeKind::Straight {
+                    if kind == EdgeKind::Straight && edge.source != edge.target {
                         geometries.push(None);
                         continue;
                     }
@@ -128,12 +138,26 @@ impl Graph {
                             .get(&edge.target)
                             .map_or(0, |runtime| runtime.revision),
                     );
-                    let a = positions[layout.source];
-                    let b = positions[layout.target];
-                    geometries.push(Some(cache.get_or_insert_with(
-                        edge.id,
-                        stamp,
-                        || match kind {
+                    let a = connection_edge_world_position(
+                        positions[layout.source],
+                        connection_geometry_size(
+                            self.scene.node_sizes[layout.source],
+                            renderer.node_appearance(&self.model.nodes[layout.source], zoom),
+                            zoom,
+                        ),
+                        self.source_handle_position,
+                    );
+                    let b = connection_edge_world_position(
+                        positions[layout.target],
+                        connection_geometry_size(
+                            self.scene.node_sizes[layout.target],
+                            renderer.node_appearance(&self.model.nodes[layout.target], zoom),
+                            zoom,
+                        ),
+                        self.target_handle_position,
+                    );
+                    geometries.push(Some(cache.get_or_insert_with(edge.id, stamp, || {
+                        match kind {
                             EdgeKind::Bezier => {
                                 let (curve, _) = crate::connection::bezier_path(
                                     a,
@@ -159,23 +183,22 @@ impl Graph {
                                     })
                                     .collect()
                             }
-                            EdgeKind::SmoothStep => {
-                                let (source_side, target_side) = facing_sides(a, b);
-                                let a = node_side_point(
+                            EdgeKind::Step => {
+                                crate::connection::step_path(
                                     a,
-                                    self.scene.node_sizes[layout.source],
-                                    source_side,
-                                );
-                                let b = node_side_point(
+                                    self.source_handle_position,
                                     b,
-                                    self.scene.node_sizes[layout.target],
-                                    target_side,
-                                );
+                                    self.target_handle_position,
+                                    2.0,
+                                )
+                                .0
+                            }
+                            EdgeKind::SmoothStep => {
                                 crate::connection::smooth_step_path(
                                     a,
-                                    source_side,
+                                    self.source_handle_position,
                                     b,
-                                    target_side,
+                                    self.target_handle_position,
                                     2.0,
                                 )
                                 .0
@@ -183,9 +206,9 @@ impl Graph {
                             EdgeKind::Custom => {
                                 renderer.edge_path(edge, a, b).unwrap_or_else(|| vec![a, b])
                             }
-                            EdgeKind::Straight => vec![a, b],
-                        },
-                    )));
+                            EdgeKind::Straight => self_loop_path(a, b),
+                        }
+                    })));
                 }
                 self.edge_geometry_cache = cache;
                 self.scene.edge_geometries = geometry_buffer;
@@ -340,22 +363,33 @@ pub(super) fn resize_handle_position(
 
 pub(super) fn connection_handle_position(
     center: Point<Pixels>,
-    radius_pixels: f32,
+    node_size: crate::WorldSize,
     kind: HandleKind,
     target_position: Position,
     source_position: Position,
     zoom: f32,
 ) -> Point<Pixels> {
-    let offset = px(radius_pixels + CONNECTION_HANDLE_GAP_WORLD * zoom);
     match if kind == HandleKind::Target {
         target_position
     } else {
         source_position
     } {
-        Position::Left => point(center.x - offset, center.y),
-        Position::Top => point(center.x, center.y - offset),
-        Position::Right => point(center.x + offset, center.y),
-        Position::Bottom => point(center.x, center.y + offset),
+        Position::Left => point(
+            center.x - px((node_size.width * 0.5 + CONNECTION_HANDLE_GAP_WORLD) * zoom),
+            center.y,
+        ),
+        Position::Top => point(
+            center.x,
+            center.y - px((node_size.height * 0.5 + CONNECTION_HANDLE_GAP_WORLD) * zoom),
+        ),
+        Position::Right => point(
+            center.x + px((node_size.width * 0.5 + CONNECTION_HANDLE_GAP_WORLD) * zoom),
+            center.y,
+        ),
+        Position::Bottom => point(
+            center.x,
+            center.y + px((node_size.height * 0.5 + CONNECTION_HANDLE_GAP_WORLD) * zoom),
+        ),
     }
 }
 

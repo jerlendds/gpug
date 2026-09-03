@@ -342,7 +342,7 @@ impl Graph {
         position: Point<Pixels>,
         end: bool,
     ) -> Option<(HandleKey, WorldPoint)> {
-        let hit = px(CONNECTION_HANDLE_SIZE_WORLD * self.viewport.zoom());
+        let handle_diameter = px(CONNECTION_HANDLE_SIZE_WORLD * self.viewport.zoom());
         self.model
             .nodes
             .iter()
@@ -390,9 +390,15 @@ impl Graph {
                 }
                 let handle_position = connection_handle_position(
                     center,
-                    self.renderer
-                        .node_appearance(node, self.viewport.zoom())
-                        .radius_pixels,
+                    connection_geometry_size(
+                        self.model
+                            .store
+                            .runtimes
+                            .get(&node.id)
+                            .map_or(node.size, |runtime| runtime.measured),
+                        self.renderer.node_appearance(node, self.viewport.zoom()),
+                        self.viewport.zoom(),
+                    ),
                     kind,
                     self.target_handle_position,
                     self.source_handle_position,
@@ -400,12 +406,9 @@ impl Graph {
                 );
                 let dx = (handle_position.x - position.x).abs();
                 let dy = (handle_position.y - position.y).abs();
-                let center_distance = (center.x - position.x).abs();
-                // The fallback handles can be close to the node center at low
-                // zoom. Do not let their generous hit box swallow the endpoint
-                // hotspot used for reconnecting a selected edge.
-                (dx <= hit && dy <= hit && dx < center_distance).then_some((
-                    (dx / px(1.0)).powi(2) + (dy / px(1.0)).powi(2),
+                let distance_squared = (dx / px(1.0)).powi(2) + (dy / px(1.0)).powi(2);
+                connection_handle_contains(position, handle_position, handle_diameter).then_some((
+                    distance_squared,
                     HandleKey {
                         node: node.id,
                         id: None,
@@ -427,19 +430,71 @@ impl Graph {
         &self,
         position: Point<Pixels>,
     ) -> Option<(HandleKey, ConnectionIntent)> {
-        let hit = px(RECONNECT_HANDLE_SIZE_WORLD * self.viewport.zoom());
         self.model
             .edges
             .iter()
-            .filter(|edge| self.model.store.edge_selected(edge) && edge.reconnectable)
-            .find_map(|edge| {
+            .enumerate()
+            .filter(|(_, edge)| edge.reconnectable)
+            .find_map(|(index, edge)| {
                 let source = self.model.node(edge.source)?;
                 let target = self.model.node(edge.target)?;
-                let source_point = self.world_to_screen(self.node_center(source));
-                let target_point = self.world_to_screen(self.node_center(target));
-                if (source_point.x - position.x).abs() <= hit
-                    && (source_point.y - position.y).abs() <= hit
+                let straight;
+                let world_path = match self
+                    .scene
+                    .edge_geometries
+                    .get(index)
+                    .and_then(Option::as_deref)
                 {
+                    Some(path) => path,
+                    None => {
+                        straight = [
+                            connection_edge_world_position(
+                                self.node_center(source),
+                                connection_geometry_size(
+                                    self.model
+                                        .store
+                                        .runtimes
+                                        .get(&source.id)
+                                        .map_or(source.size, |runtime| runtime.measured),
+                                    self.renderer.node_appearance(source, self.viewport.zoom()),
+                                    self.viewport.zoom(),
+                                ),
+                                self.source_handle_position,
+                            ),
+                            connection_edge_world_position(
+                                self.node_center(target),
+                                connection_geometry_size(
+                                    self.model
+                                        .store
+                                        .runtimes
+                                        .get(&target.id)
+                                        .map_or(target.size, |runtime| runtime.measured),
+                                    self.renderer.node_appearance(target, self.viewport.zoom()),
+                                    self.viewport.zoom(),
+                                ),
+                                self.target_handle_position,
+                            ),
+                        ];
+                        &straight
+                    }
+                };
+                let screen_path = world_path
+                    .iter()
+                    .map(|point| self.world_to_screen(*point))
+                    .collect::<Vec<_>>();
+                let edge_width = self.renderer.edge_appearance(edge).width_pixels;
+                let zoom = self.viewport.zoom();
+                let source_distance =
+                    reconnect_path_end_distance(position, &screen_path, true, edge_width, zoom);
+                let target_distance =
+                    reconnect_path_end_distance(position, &screen_path, false, edge_width, zoom);
+                let reconnect_source = match (source_distance, target_distance) {
+                    (Some(source), Some(target)) => source <= target,
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => return None,
+                };
+                if reconnect_source {
                     Some((
                         HandleKey {
                             node: target.id,
@@ -448,9 +503,7 @@ impl Graph {
                         },
                         ConnectionIntent::ReconnectSource(edge.id),
                     ))
-                } else if (target_point.x - position.x).abs() <= hit
-                    && (target_point.y - position.y).abs() <= hit
-                {
+                } else {
                     Some((
                         HandleKey {
                             node: source.id,
@@ -459,8 +512,6 @@ impl Graph {
                         },
                         ConnectionIntent::ReconnectTarget(edge.id),
                     ))
-                } else {
-                    None
                 }
             })
     }
@@ -532,7 +583,7 @@ impl Graph {
             && self.layout_edges.len() == self.model.edges.len()
             && self.model.store.columns.len() == self.model.nodes.len();
 
-        let nearest = |start: Point<Pixels>, end: Point<Pixels>, tolerance: f32| {
+        let near_segment = |start: Point<Pixels>, end: Point<Pixels>, tolerance: f32| {
             let start_x = start.x / px(1.0);
             let start_y = start.y / px(1.0);
             let end_x = end.x / px(1.0);
@@ -571,9 +622,59 @@ impl Graph {
                 .enumerate()
             {
                 let tolerance = edge.interaction_width_for_hit_testing() * 0.5;
-                let start = self.world_to_screen(columns.center(layout.source));
-                let end = self.world_to_screen(columns.center(layout.target));
-                if nearest(start, end, tolerance) {
+                let geometry = self
+                    .scene
+                    .edge_geometries
+                    .get(edge_index)
+                    .and_then(Option::as_deref);
+                let hit = if let Some(points) = geometry {
+                    points.windows(2).any(|pair| {
+                        near_segment(
+                            self.world_to_screen(pair[0]),
+                            self.world_to_screen(pair[1]),
+                            tolerance,
+                        )
+                    })
+                } else {
+                    let start = connection_edge_world_position(
+                        columns.center(layout.source),
+                        connection_geometry_size(
+                            self.scene
+                                .node_sizes
+                                .get(layout.source)
+                                .copied()
+                                .unwrap_or(self.model.nodes[layout.source].size),
+                            self.renderer.node_appearance(
+                                &self.model.nodes[layout.source],
+                                self.viewport.zoom(),
+                            ),
+                            self.viewport.zoom(),
+                        ),
+                        self.source_handle_position,
+                    );
+                    let end = connection_edge_world_position(
+                        columns.center(layout.target),
+                        connection_geometry_size(
+                            self.scene
+                                .node_sizes
+                                .get(layout.target)
+                                .copied()
+                                .unwrap_or(self.model.nodes[layout.target].size),
+                            self.renderer.node_appearance(
+                                &self.model.nodes[layout.target],
+                                self.viewport.zoom(),
+                            ),
+                            self.viewport.zoom(),
+                        ),
+                        self.target_handle_position,
+                    );
+                    near_segment(
+                        self.world_to_screen(start),
+                        self.world_to_screen(end),
+                        tolerance,
+                    )
+                };
+                if hit {
                     return Some(edge_index);
                 }
             }
@@ -590,7 +691,7 @@ impl Graph {
                 let tolerance = edge.interaction_width_for_hit_testing() * 0.5;
                 let start = self.world_to_screen(self.node_center(source));
                 let end = self.world_to_screen(self.node_center(target));
-                nearest(start, end, tolerance).then_some(edge_index)
+                near_segment(start, end, tolerance).then_some(edge_index)
             })
     }
 

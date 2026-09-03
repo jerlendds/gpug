@@ -53,7 +53,7 @@ fn main() {
                 }
                 graph
             });
-            cx.new(|cx| ExampleView::new(graph, None, cx))
+            cx.new(|cx| ExampleView::new(graph, None, false, cx))
         })
         .unwrap();
     });

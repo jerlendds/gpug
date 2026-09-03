@@ -38,10 +38,8 @@ Created with Create GPUI App, to get started with GPUI visit the GPUI documentat
 - [gpui tutorial](https://github.com/hedge-ops/gpui-tutorial)
 - [gpui component library](https://github.com/longbridge/gpui-component)
 - [gpui music player](https://github.com/143mailliw/hummingbird)
-- [gpui examples visualized](https://studium.dev/tech/playing-gpui-rust)
-
-
-- [gpug notes from jerlendds](https://studium.dev/tech/gpui-networks)
+- [gpui-kit](https://github.com/longbridge/gpui-kit)
+- [first gpui app | sheerluck.dev](https://blog.sheerluck.dev/posts/your-first-gpui-app-building-a-desktop-ui-in-rust/)
 
 
 ## Usage

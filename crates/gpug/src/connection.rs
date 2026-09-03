@@ -255,8 +255,7 @@ pub fn edge_position(
 }
 
 pub fn valid_connection(from: &HandleKey, to: &HandleKey, mode: ConnectionMode) -> bool {
-    from.node != to.node
-        && from != to
+    from != to
         && (mode == ConnectionMode::Loose
             || matches!(
                 (from.kind, to.kind),
@@ -330,7 +329,7 @@ pub fn connection(source: NodeId, target: NodeId) -> Connection {
     }
 }
 
-pub fn smooth_step_path(
+fn step_corners(
     a: WorldPoint,
     a_side: Position,
     b: WorldPoint,
@@ -379,7 +378,33 @@ pub fn smooth_step_path(
         }
         simplified.push(point);
     }
-    let corners = simplified;
+    (simplified, center)
+}
+
+pub(crate) fn step_path(
+    a: WorldPoint,
+    a_side: Position,
+    b: WorldPoint,
+    b_side: Position,
+    step: f32,
+) -> (Vec<WorldPoint>, WorldPoint) {
+    step_corners(a, a_side, b, b_side, step)
+}
+
+pub fn smooth_step_path(
+    a: WorldPoint,
+    a_side: Position,
+    b: WorldPoint,
+    b_side: Position,
+    step: f32,
+) -> (Vec<WorldPoint>, WorldPoint) {
+    let (corners, center) = step_corners(a, a_side, b, b_side, step);
+    let distance = (b.x - a.x).abs() + (b.y - a.y).abs();
+    let step = if step.is_finite() {
+        step.max(0.0).min(distance * 0.25)
+    } else {
+        0.0
+    };
 
     let mut points = Vec::with_capacity(corners.len() * 4);
     points.push(corners[0]);
@@ -420,6 +445,20 @@ pub fn smooth_step_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn step_keeps_hard_axis_aligned_corners() {
+        let a = WorldPoint::new(0.0, 0.0);
+        let b = WorldPoint::new(10.0, 8.0);
+        let (points, _) = step_path(a, Position::Right, b, Position::Left, 2.0);
+
+        assert_eq!(points.first(), Some(&a));
+        assert_eq!(points.last(), Some(&b));
+        assert!(points.windows(2).all(|segment| {
+            (segment[0].x - segment[1].x).abs() < 0.0001
+                || (segment[0].y - segment[1].y).abs() < 0.0001
+        }));
+    }
 
     #[test]
     fn smooth_step_clamps_clearance_and_rounds_corners() {
@@ -469,6 +508,15 @@ mod tests {
             },
             ConnectionMode::Strict
         ));
+        assert!(valid_connection(
+            &c.source,
+            &HandleKey {
+                node: c.source.node,
+                id: None,
+                kind: HandleKind::Target
+            },
+            ConnectionMode::Strict
+        ));
     }
 
     #[test]
@@ -488,6 +536,48 @@ mod tests {
         controller.update(WorldPoint::ZERO, Some(&target), std::iter::empty());
         assert!(controller.finish().is_some());
         assert_eq!(controller.state, ConnectionState::Idle);
+    }
+
+    #[test]
+    fn controller_tracks_pointer_and_finishes_a_same_node_source_to_target_drag() {
+        let source = HandleKey {
+            node: NodeId(7),
+            id: Some("source".into()),
+            kind: HandleKind::Source,
+        };
+        let target = Handle {
+            key: HandleKey {
+                node: NodeId(7),
+                id: Some("target".into()),
+                kind: HandleKind::Target,
+            },
+            bounds: crate::WorldBounds::new(
+                WorldPoint::new(-1.0, -1.0),
+                crate::WorldSize::new(2.0, 2.0),
+            ),
+            position: Position::Top,
+            connectable_start: true,
+            connectable_end: true,
+            validation: HandleValidation::Inherit,
+        };
+        let mut controller = ConnectionController::default();
+
+        assert!(controller.arm(source.clone(), ConnectionIntent::Create));
+        assert!(controller.begin(WorldPoint::new(0.0, 4.0)));
+        controller.update(WorldPoint::new(3.0, 2.0), Some(&target), std::iter::empty());
+        assert_eq!(
+            controller.pending(),
+            Some((
+                source.clone(),
+                ConnectionIntent::Create,
+                WorldPoint::new(3.0, 2.0)
+            ))
+        );
+
+        let (connection, intent) = controller.finish().expect("valid self-loop connection");
+        assert_eq!(intent, ConnectionIntent::Create);
+        assert_eq!(connection.source, source);
+        assert_eq!(connection.target, target.key);
     }
     #[test]
     fn pending_reports_the_origin_of_a_drop_on_the_pane() {

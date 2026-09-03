@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use gpug::Graph;
 use gpug::{
     Edge, EdgeMarker, GraphData, GraphEvent, GraphRenderer, Node, NodeAppearance, NodeShape,
-    WorldPoint, WorldSize,
+    Position, WorldPoint, WorldSize,
 };
 use gpui::{
     canvas, div, prelude::*, px, rgb, App, AppContext, Application, Context, Entity, IntoElement,
@@ -44,9 +44,12 @@ pub struct CatalogExample {
     pub node_count: usize,
     pub show_handles: bool,
     pub show_resize_handles: bool,
+    pub handle_positions: Option<(Position, Position)>,
     pub on_event: Option<ExampleEventHandler>,
     pub initial_data: Option<fn() -> GraphData>,
     pub configure_renderer: Option<ExampleRendererSetup>,
+    pub markerless_created_edges: bool,
+    pub show_zoom: bool,
 }
 
 impl CatalogExample {
@@ -57,11 +60,14 @@ impl CatalogExample {
             node_types: &["default"],
             edge_types: &["default"],
             node_count: 5,
-            show_handles: false,
+            show_handles: true,
             show_resize_handles: false,
+            handle_positions: None,
             on_event: None,
             initial_data: None,
             configure_renderer: None,
+            markerless_created_edges: false,
+            show_zoom: false,
         }
     }
 
@@ -85,6 +91,10 @@ impl CatalogExample {
         self.show_resize_handles = visible;
         self
     }
+    pub const fn handle_positions(mut self, target: Position, source: Position) -> Self {
+        self.handle_positions = Some((target, source));
+        self
+    }
     pub const fn on_event(mut self, handler: ExampleEventHandler) -> Self {
         self.on_event = Some(handler);
         self
@@ -95,6 +105,14 @@ impl CatalogExample {
     }
     pub const fn configure_renderer(mut self, setup: ExampleRendererSetup) -> Self {
         self.configure_renderer = Some(setup);
+        self
+    }
+    pub const fn markerless_created_edges(mut self) -> Self {
+        self.markerless_created_edges = true;
+        self
+    }
+    pub const fn show_zoom(mut self, visible: bool) -> Self {
+        self.show_zoom = visible;
         self
     }
 }
@@ -112,14 +130,19 @@ pub fn run_catalog_example(example: CatalogExample) {
                     if let Some(setup) = example.configure_renderer {
                         setup(&mut renderer);
                     }
-                    return Graph::builder()
+                    let mut builder = Graph::builder()
                         .data(initial_data())
                         .renderer(renderer)
                         .fit_on_load()
                         .show_handles(example.show_handles)
-                        .show_resize_handles(example.show_resize_handles)
-                        .build(cx)
-                        .unwrap();
+                        .show_resize_handles(example.show_resize_handles);
+                    if let Some((target, source)) = example.handle_positions {
+                        builder = builder.handle_positions(target, source);
+                    }
+                    if example.markerless_created_edges {
+                        builder = builder.default_edge_markers(None, None);
+                    }
+                    return builder.build(cx).unwrap();
                 }
                 let count = example.node_count.max(2);
                 let mut nodes = Vec::with_capacity(count);
@@ -171,17 +194,22 @@ pub fn run_catalog_example(example: CatalogExample) {
                 if let Some(setup) = example.configure_renderer {
                     setup(&mut renderer);
                 }
-                Graph::builder()
+                let mut builder = Graph::builder()
                     .data(GraphData::new(nodes, edges))
                     .renderer(renderer)
                     .fit_on_load()
                     .show_handles(example.show_handles)
-                    .show_resize_handles(example.show_resize_handles)
-                    .build(cx)
-                    .unwrap()
+                    .show_resize_handles(example.show_resize_handles);
+                if let Some((target, source)) = example.handle_positions {
+                    builder = builder.handle_positions(target, source);
+                }
+                if example.markerless_created_edges {
+                    builder = builder.default_edge_markers(None, None);
+                }
+                builder.build(cx).unwrap()
             });
             let on_event = example.on_event;
-            cx.new(|cx| ExampleView::new(graph, on_event, cx))
+            cx.new(|cx| ExampleView::new(graph, on_event, example.show_zoom, cx))
         })
         .unwrap();
     });
@@ -291,6 +319,50 @@ pub struct ExampleView {
     graph: Entity<Graph>,
     frame_meter: Entity<FrameMeter>,
     event_log: Entity<EventLog>,
+    zoom_panel: Option<Entity<ZoomPanel>>,
+}
+
+struct ZoomPanel {
+    graph: Entity<Graph>,
+    zoom: f32,
+}
+
+impl Render for ZoomPanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let graph = self.graph.clone();
+        let panel = cx.entity();
+        let poller = canvas(
+            |_, _, _| (),
+            move |_, _, window, cx| {
+                window.request_animation_frame();
+                let zoom = cx.read_entity(&graph, |graph, _| graph.viewport().zoom());
+                cx.update_entity(&panel, |panel, cx| {
+                    if panel.zoom.to_bits() != zoom.to_bits() {
+                        panel.zoom = zoom;
+                        cx.notify();
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size(px(1.0));
+
+        div()
+            .absolute()
+            .top(px(8.0))
+            .right(px(8.0))
+            .child(poller)
+            .child(
+                div()
+                    .bg(rgb(0xf7f7f7))
+                    .border(px(1.0))
+                    .border_color(rgb(0xcccccc))
+                    .rounded(px(6.0))
+                    .p(px(8.0))
+                    .cursor_default()
+                    .child(format!("Zoom: {:.2}×", self.zoom)),
+            )
+    }
 }
 
 struct EventLog {
@@ -346,7 +418,19 @@ impl Render for EventLog {
 }
 
 impl ExampleView {
-    pub fn new(graph: Entity<Graph>, on_event: Option<ExampleEventHandler>, cx: &mut App) -> Self {
+    pub fn new(
+        graph: Entity<Graph>,
+        on_event: Option<ExampleEventHandler>,
+        show_zoom: bool,
+        cx: &mut App,
+    ) -> Self {
+        let zoom_panel = show_zoom.then(|| {
+            let zoom = cx.read_entity(&graph, |graph, _| graph.viewport().zoom());
+            cx.new(|_| ZoomPanel {
+                graph: graph.clone(),
+                zoom,
+            })
+        });
         Self {
             event_log: cx.new(|_| EventLog {
                 graph: graph.clone(),
@@ -355,17 +439,22 @@ impl ExampleView {
             }),
             graph,
             frame_meter: cx.new(|_| FrameMeter::new()),
+            zoom_panel,
         }
     }
 }
 
 impl Render for ExampleView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let mut root = div()
             .relative()
             .size_full()
             .child(self.graph.clone())
             .child(self.event_log.clone())
-            .child(self.frame_meter.clone())
+            .child(self.frame_meter.clone());
+        if let Some(panel) = &self.zoom_panel {
+            root = root.child(panel.clone());
+        }
+        root
     }
 }

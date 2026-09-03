@@ -1,5 +1,62 @@
 use super::*;
 
+fn polyline_midpoint(points: &[WorldPoint]) -> Option<WorldPoint> {
+    let first = *points.first()?;
+    let total = points
+        .windows(2)
+        .map(|segment| {
+            let dx = segment[1].x - segment[0].x;
+            let dy = segment[1].y - segment[0].y;
+            dx.hypot(dy)
+        })
+        .sum::<f32>();
+    if total <= f32::EPSILON {
+        return Some(first);
+    }
+
+    let mut remaining = total * 0.5;
+    for segment in points.windows(2) {
+        let dx = segment[1].x - segment[0].x;
+        let dy = segment[1].y - segment[0].y;
+        let length = dx.hypot(dy);
+        if remaining <= length {
+            let t = remaining / length;
+            return Some(WorldPoint::new(
+                segment[0].x + dx * t,
+                segment[0].y + dy * t,
+            ));
+        }
+        remaining -= length;
+    }
+    points.last().copied()
+}
+
+#[cfg(test)]
+mod edge_label_tests {
+    use super::polyline_midpoint;
+    use crate::WorldPoint;
+
+    #[test]
+    fn straight_edge_midpoint_is_halfway_between_endpoints() {
+        assert_eq!(
+            polyline_midpoint(&[WorldPoint::new(2.0, 4.0), WorldPoint::new(10.0, 8.0)]),
+            Some(WorldPoint::new(6.0, 6.0))
+        );
+    }
+
+    #[test]
+    fn routed_edge_midpoint_follows_path_length() {
+        assert_eq!(
+            polyline_midpoint(&[
+                WorldPoint::new(0.0, 0.0),
+                WorldPoint::new(8.0, 0.0),
+                WorldPoint::new(8.0, 4.0),
+            ]),
+            Some(WorldPoint::new(6.0, 0.0))
+        );
+    }
+}
+
 impl Render for Graph {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _frame = profile::scope(Phase::Render);
@@ -143,17 +200,24 @@ impl Render for Graph {
                 valid,
                 ..
             } => self.model.node(from.node).map(|node| {
-                let center = self.world_to_screen(self.node_center(node));
-                let origin = self.screen_to_world(connection_handle_position(
-                    center,
-                    self.renderer
-                        .node_appearance(node, self.viewport.zoom())
-                        .radius_pixels,
-                    from.kind,
-                    self.target_handle_position,
-                    self.source_handle_position,
-                    self.viewport.zoom(),
-                ));
+                let side = if from.kind == HandleKind::Target {
+                    self.target_handle_position
+                } else {
+                    self.source_handle_position
+                };
+                let origin = connection_edge_world_position(
+                    self.node_center(node),
+                    connection_geometry_size(
+                        self.model
+                            .store
+                            .runtimes
+                            .get(&node.id)
+                            .map_or(node.size, |runtime| runtime.measured),
+                        renderer.node_appearance(node, self.viewport.zoom()),
+                        self.viewport.zoom(),
+                    ),
+                    side,
+                );
                 let appearance =
                     renderer.connection_line_appearance(&crate::ConnectionLineContext {
                         from,
@@ -357,11 +421,28 @@ impl Render for Graph {
                         }
                         if edge_appearances[edge_index] != default_edge
                             || edge_kinds[edge_index] != EdgeKind::Straight
+                            || edge.source == edge.target
                         {
                             continue;
                         }
-                        let p1 = viewport.world_to_screen(positions[edge.source]);
-                        let p2 = viewport.world_to_screen(positions[edge.target]);
+                        let p1 = viewport.world_to_screen(connection_edge_world_position(
+                            positions[edge.source],
+                            connection_geometry_size(
+                                node_sizes[edge.source],
+                                node_appearances[edge.source],
+                                viewport.zoom(),
+                            ),
+                            source_handle_position,
+                        ));
+                        let p2 = viewport.world_to_screen(connection_edge_world_position(
+                            positions[edge.target],
+                            connection_geometry_size(
+                                node_sizes[edge.target],
+                                node_appearances[edge.target],
+                                viewport.zoom(),
+                            ),
+                            target_handle_position,
+                        ));
                         if (p1.x < bounds.left() && p2.x < bounds.left())
                             || (p1.x > bounds.right() && p2.x > bounds.right())
                             || (p1.y < bounds.top() && p2.y < bounds.top())
@@ -426,7 +507,10 @@ impl Render for Graph {
                         }
                         let appearance = edge_appearances[edge_index];
                         let kind = edge_kinds[edge_index];
-                        if appearance == default_edge && kind == EdgeKind::Straight {
+                        if appearance == default_edge
+                            && kind == EdgeKind::Straight
+                            && edge.source != edge.target
+                        {
                             continue;
                         }
                         // Straight edges carry no cached geometry; a custom
@@ -439,7 +523,26 @@ impl Render for Graph {
                         {
                             Some(points) => points.as_slice(),
                             None => {
-                                straight = [positions[edge.source], positions[edge.target]];
+                                straight = [
+                                    connection_edge_world_position(
+                                        positions[edge.source],
+                                        connection_geometry_size(
+                                            node_sizes[edge.source],
+                                            node_appearances[edge.source],
+                                            viewport.zoom(),
+                                        ),
+                                        source_handle_position,
+                                    ),
+                                    connection_edge_world_position(
+                                        positions[edge.target],
+                                        connection_geometry_size(
+                                            node_sizes[edge.target],
+                                            node_appearances[edge.target],
+                                            viewport.zoom(),
+                                        ),
+                                        target_handle_position,
+                                    ),
+                                ];
                                 &straight[..]
                             }
                         };
@@ -495,7 +598,26 @@ impl Render for Graph {
                             {
                                 Some(points) => points.as_slice(),
                                 None => {
-                                    straight = [positions[edge.source], positions[edge.target]];
+                                    straight = [
+                                        connection_edge_world_position(
+                                            positions[edge.source],
+                                            connection_geometry_size(
+                                                node_sizes[edge.source],
+                                                node_appearances[edge.source],
+                                                viewport.zoom(),
+                                            ),
+                                            source_handle_position,
+                                        ),
+                                        connection_edge_world_position(
+                                            positions[edge.target],
+                                            connection_geometry_size(
+                                                node_sizes[edge.target],
+                                                node_appearances[edge.target],
+                                                viewport.zoom(),
+                                            ),
+                                            target_handle_position,
+                                        ),
+                                    ];
                                     &straight[..]
                                 }
                             };
@@ -579,7 +701,26 @@ impl Render for Graph {
                         {
                             Some(points) => points.as_slice(),
                             None => {
-                                straight = [positions[edge.source], positions[edge.target]];
+                                straight = [
+                                    connection_edge_world_position(
+                                        positions[edge.source],
+                                        connection_geometry_size(
+                                            node_sizes[edge.source],
+                                            node_appearances[edge.source],
+                                            viewport.zoom(),
+                                        ),
+                                        source_handle_position,
+                                    ),
+                                    connection_edge_world_position(
+                                        positions[edge.target],
+                                        connection_geometry_size(
+                                            node_sizes[edge.target],
+                                            node_appearances[edge.target],
+                                            viewport.zoom(),
+                                        ),
+                                        target_handle_position,
+                                    ),
+                                ];
                                 &straight[..]
                             }
                         };
@@ -883,16 +1024,28 @@ impl Render for Graph {
                         let inner_half = (outer_half - px(1.0)).max(px(0.0));
                         let mut handle_borders = Path::new(point(px(0.0), px(0.0)));
                         let mut handle_fills = Path::new(point(px(0.0), px(0.0)));
-                        macro_rules! push_square {
-                            ($path:expr, $center:expr, $half:expr) => {{
+                        macro_rules! push_circle {
+                            ($path:expr, $center:expr, $radius:expr) => {{
                                 let center = $center;
-                                let half = $half;
-                                let a = point(center.x - half, center.y - half);
-                                let b = point(center.x + half, center.y - half);
-                                let c = point(center.x + half, center.y + half);
-                                let d = point(center.x - half, center.y + half);
-                                $path.push_triangle((a, b, c), st);
-                                $path.push_triangle((a, c, d), st);
+                                let radius = $radius;
+                                for segment in 0..16 {
+                                    let a = segment as f32 / 16.0 * std::f32::consts::TAU;
+                                    let b = (segment + 1) as f32 / 16.0 * std::f32::consts::TAU;
+                                    $path.push_triangle(
+                                        (
+                                            center,
+                                            point(
+                                                center.x + radius * a.cos(),
+                                                center.y + radius * a.sin(),
+                                            ),
+                                            point(
+                                                center.x + radius * b.cos(),
+                                                center.y + radius * b.sin(),
+                                            ),
+                                        ),
+                                        st,
+                                    );
+                                }
                             }};
                         }
                         for (index, position) in positions.iter().enumerate() {
@@ -909,15 +1062,19 @@ impl Render for Graph {
                             for kind in [HandleKind::Target, HandleKind::Source] {
                                 let handle = connection_handle_position(
                                     center,
-                                    node_appearances[index].radius_pixels,
+                                    connection_geometry_size(
+                                        node_sizes[index],
+                                        node_appearances[index],
+                                        viewport.zoom(),
+                                    ),
                                     kind,
                                     target_handle_position,
                                     source_handle_position,
                                     viewport.zoom(),
                                 );
-                                push_square!(handle_borders, handle, outer_half);
+                                push_circle!(handle_borders, handle, outer_half);
                                 if inner_half > px(0.0) {
-                                    push_square!(handle_fills, handle, inner_half);
+                                    push_circle!(handle_fills, handle, inner_half);
                                 }
                             }
                         }
@@ -936,15 +1093,15 @@ impl Render for Graph {
                             continue;
                         }
                         let center = viewport.world_to_screen(positions[index]);
-                        let selection_size =
-                            if matches!(node_appearances[index].shape, NodeShape::None) {
-                                size(
-                                    px((node_sizes[index].width * viewport.zoom()).max(1.0)),
-                                    px((node_sizes[index].height * viewport.zoom()).max(1.0)),
-                                )
-                            } else {
-                                size(px(18.0), px(18.0))
-                            };
+                        let geometry_size = connection_geometry_size(
+                            node_sizes[index],
+                            node_appearances[index],
+                            viewport.zoom(),
+                        );
+                        let selection_size = size(
+                            px((geometry_size.width * viewport.zoom()).max(1.0)),
+                            px((geometry_size.height * viewport.zoom()).max(1.0)),
+                        );
                         window.paint_quad(outline(
                             Bounds::centered_at(center, selection_size),
                             rgb(style.selection_color),
@@ -955,18 +1112,21 @@ impl Render for Graph {
                             for kind in [HandleKind::Target, HandleKind::Source] {
                                 let handle = connection_handle_position(
                                     center,
-                                    node_appearances[index].radius_pixels,
+                                    connection_geometry_size(
+                                        node_sizes[index],
+                                        node_appearances[index],
+                                        viewport.zoom(),
+                                    ),
                                     kind,
                                     target_handle_position,
                                     source_handle_position,
                                     viewport.zoom(),
                                 );
-                                window.paint_quad(fill(
+                                window.paint_quad(quad(
                                     Bounds::centered_at(handle, size(handle_size, handle_size)),
+                                    handle_size * 0.5,
                                     rgb(0xffffff),
-                                ));
-                                window.paint_quad(outline(
-                                    Bounds::centered_at(handle, size(handle_size, handle_size)),
+                                    px(1.0),
                                     rgb(0x1e90ff),
                                     BorderStyle::default(),
                                 ));
@@ -1197,6 +1357,8 @@ impl Render for Graph {
 
         let canvas_cursor = if self.pan_drag_position.is_some() || self.drag_nodes.is_some() {
             CursorStyle::ClosedHand
+        } else if self.pointer_over_reconnect {
+            CursorStyle::PointingHand
         } else if self.pointer_over_handle {
             CursorStyle::Crosshair
         } else if self.pointer_over_graph_item {
@@ -1213,29 +1375,71 @@ impl Render for Graph {
         };
         let edge_labels = labelled_edges
             .iter()
-            .filter(|edge| reconnecting_edge != Some(edge.id))
-            .filter_map(|edge| {
+            .enumerate()
+            .filter(|(_, edge)| reconnecting_edge != Some(edge.id))
+            .filter_map(|(edge_index, edge)| {
                 let label = edge.label.as_ref()?;
-                let source = self
-                    .model
-                    .store
-                    .node_center_absolute(self.model.node(edge.source)?);
-                let target = self
-                    .model
-                    .store
-                    .node_center_absolute(self.model.node(edge.target)?);
-                let midpoint = self.viewport.world_to_screen(WorldPoint::new(
-                    (source.x + target.x) * 0.5,
-                    (source.y + target.y) * 0.5,
-                ));
+                let layout = self.layout_edges.get(edge_index)?;
+                let straight;
+                let points = match self
+                    .scene
+                    .edge_geometries
+                    .get(edge_index)
+                    .and_then(|geometry| geometry.as_ref())
+                {
+                    Some(points) => points.as_slice(),
+                    None => {
+                        straight = [
+                            connection_edge_world_position(
+                                self.scene.positions[layout.source],
+                                connection_geometry_size(
+                                    self.scene.node_sizes[layout.source],
+                                    self.scene.node_appearances[layout.source],
+                                    self.viewport.zoom(),
+                                ),
+                                self.source_handle_position,
+                            ),
+                            connection_edge_world_position(
+                                self.scene.positions[layout.target],
+                                connection_geometry_size(
+                                    self.scene.node_sizes[layout.target],
+                                    self.scene.node_appearances[layout.target],
+                                    self.viewport.zoom(),
+                                ),
+                                self.target_handle_position,
+                            ),
+                        ];
+                        &straight
+                    }
+                };
+                let source = *points.first()?;
+                let target = *points.last()?;
+                let middle = polyline_midpoint(points)?;
+                let midpoint = self.viewport.world_to_screen(middle);
+                let source = self.viewport.world_to_screen(source);
+                let target = self.viewport.world_to_screen(target);
+                if let Some(renderer) = self.renderer.edge_label_renderer() {
+                    return Some(renderer.render(
+                        edge,
+                        crate::EdgeLabelContext {
+                            source,
+                            midpoint,
+                            target,
+                            zoom: self.viewport.zoom(),
+                        },
+                    ));
+                }
+                let label_scale = self.viewport.zoom().max(0.0);
                 Some(
                     div()
                         .absolute()
                         .left(midpoint.x)
                         .top(midpoint.y)
-                        .px_1()
+                        .px(px(0.25 * label_scale))
+                        .text_size(px(1.2 * label_scale))
                         .bg(rgba(0xffffffe0))
-                        .child(label.clone()),
+                        .child(label.clone())
+                        .into_any_element(),
                 )
             })
             .collect::<Vec<_>>();
@@ -1267,9 +1471,8 @@ impl Render for Graph {
                         cx.notify();
                         return;
                     }
-                    // A handle is the more specific target when its hit box
-                    // overlaps a selected edge endpoint. This keeps a drag
-                    // from the node's source handle anchored to that node.
+                    // The visible circular node handle owns only its exact
+                    // painted bounds and starts a new edge.
                     if let Some((key, _)) = graph
                         .handle_at_screen_position(event.position, false)
                         .or_else(|| graph.handle_at_screen_position(event.position, true))
@@ -1290,6 +1493,9 @@ impl Render for Graph {
                         cx.notify();
                         return;
                     }
+                    // The adjacent terminal corridor belongs to its edge and
+                    // starts reconnection directly; prior selection is not
+                    // required.
                     if let Some((key, intent)) = graph.reconnect_at_screen_position(event.position)
                     {
                         let pointer = graph.screen_to_world(event.position);
@@ -1391,6 +1597,7 @@ impl Render for Graph {
             .on_mouse_move(cx.listener(|graph, event: &MouseMoveEvent, _, cx| {
                 if let Some((index, control)) = graph.resize_node {
                     graph.pointer_over_handle = false;
+                    graph.pointer_over_reconnect = false;
                     let pointer = graph.screen_to_world(event.position);
                     if let Some(resized) = control.update(pointer) {
                         let id = graph.model.nodes[index].id;
@@ -1409,12 +1616,14 @@ impl Render for Graph {
                         .handle_at_screen_position(event.position, target_is_end)
                         .map(|(key, center)| graph.connection_handle(key, center));
                     graph.pointer_over_handle = target.is_some();
+                    graph.pointer_over_reconnect = false;
                     graph
                         .connection
                         .update(pointer, target.as_ref(), std::iter::empty());
                     graph.model.store.dirty.mark_connection();
                 } else if let Some(items) = graph.drag_nodes.clone() {
                     graph.pointer_over_handle = false;
+                    graph.pointer_over_reconnect = false;
                     if let Some(pointer) = &mut graph.pointer {
                         if !pointer.update(ViewportPoint::new(
                             event.position.x / px(1.0),
@@ -1439,6 +1648,7 @@ impl Render for Graph {
                     graph.layout_initialized = false;
                 } else if let Some(start) = graph.selection_start {
                     graph.pointer_over_handle = false;
+                    graph.pointer_over_reconnect = false;
                     graph.selection_current = Some(event.position);
                     let a = graph.screen_to_world(start);
                     let b = graph.screen_to_world(event.position);
@@ -1467,8 +1677,11 @@ impl Render for Graph {
                     graph.pan_drag_position = Some(event.position);
                     graph.pointer_over_graph_item = false;
                     graph.pointer_over_handle = false;
+                    graph.pointer_over_reconnect = false;
                 } else {
                     graph.pointer_over_handle = graph.is_handle_at_screen_position(event.position);
+                    graph.pointer_over_reconnect = !graph.pointer_over_handle
+                        && graph.reconnect_at_screen_position(event.position).is_some();
                     graph.pointer_over_graph_item =
                         graph.graph_item_at_screen_position(event.position);
                 }
@@ -1498,6 +1711,8 @@ impl Render for Graph {
                                     .with_id(graph.next_edge_id);
                             edge.source_handle = connection.source.id.as_deref().map(str::to_owned);
                             edge.target_handle = connection.target.id.as_deref().map(str::to_owned);
+                            edge.marker_start = graph.default_edge_marker_start.clone();
+                            edge.marker_end = graph.default_edge_marker_end.clone();
                             if graph.model.add_edge_with_id(edge.clone()) {
                                 graph.next_edge_id = graph.next_edge_id.wrapping_add(1);
                                 graph.events.push(GraphEvent::Connected(edge.clone()));
@@ -1571,6 +1786,8 @@ impl Render for Graph {
                     graph.pointer_over_graph_item =
                         graph.graph_item_at_screen_position(event.position);
                     graph.pointer_over_handle = graph.is_handle_at_screen_position(event.position);
+                    graph.pointer_over_reconnect = !graph.pointer_over_handle
+                        && graph.reconnect_at_screen_position(event.position).is_some();
                     graph.flush();
                     cx.notify();
                 }),

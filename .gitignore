@@ -1,7 +1,8 @@
 target
-graphpapers
 artifacts/
-# shhhhhh....
+# shhhhhh.... ;)
 crates/secret-project/
 test-loop.sh
 website/
+ngpapers/
+.agents/

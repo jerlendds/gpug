@@ -93,6 +93,7 @@ impl WorldBounds {
 pub struct Viewport {
     pan: Point<Pixels>,
     zoom: f32,
+    max_zoom: f32,
 }
 
 impl Default for Viewport {
@@ -104,8 +105,11 @@ impl Default for Viewport {
 impl Viewport {
     /// Smallest supported scale: one screen pixel represents 1,000 world units.
     pub const MIN_ZOOM: f32 = 0.001;
-    /// Largest supported scale: one world unit represents 256 screen pixels.
-    pub const MAX_ZOOM: f32 = 256.0;
+    /// Default maximum scale: one world unit represents 60 screen pixels.
+    ///
+    /// Individual viewports may override this with [`Viewport::set_max_zoom`]
+    /// or [`Viewport::with_max_zoom`].
+    pub const MAX_ZOOM: f32 = 60.0;
 
     pub fn new(pan: Point<Pixels>, zoom: f32) -> Self {
         let pan = if (pan.x / px(1.0)).is_finite() && (pan.y / px(1.0)).is_finite() {
@@ -120,7 +124,26 @@ impl Viewport {
             } else {
                 1.0
             },
+            max_zoom: Self::MAX_ZOOM,
         }
+    }
+
+    /// Sets the largest permitted zoom and clamps the current zoom to it.
+    ///
+    /// The value is a screen-pixels-per-world-unit scale. Non-finite values
+    /// and values below [`Viewport::MIN_ZOOM`] are ignored.
+    pub fn set_max_zoom(&mut self, max_zoom: f32) {
+        if max_zoom.is_finite() && max_zoom >= Self::MIN_ZOOM {
+            self.max_zoom = max_zoom;
+            self.zoom = self.zoom.min(max_zoom);
+        }
+    }
+
+    /// Configures the largest permitted zoom for this viewport.
+    #[must_use]
+    pub fn with_max_zoom(mut self, max_zoom: f32) -> Self {
+        self.set_max_zoom(max_zoom);
+        self
     }
 
     pub fn pan(&self) -> Point<Pixels> {
@@ -131,6 +154,11 @@ impl Viewport {
         self.zoom
     }
 
+    /// Returns the largest zoom accepted by this viewport.
+    pub fn max_zoom(&self) -> f32 {
+        self.max_zoom
+    }
+
     pub fn set_pan(&mut self, pan: Point<Pixels>) {
         if (pan.x / px(1.0)).is_finite() && (pan.y / px(1.0)).is_finite() {
             self.pan = pan;
@@ -139,7 +167,7 @@ impl Viewport {
 
     pub fn set_zoom(&mut self, zoom: f32) {
         if zoom.is_finite() {
-            self.zoom = zoom.clamp(Self::MIN_ZOOM, Self::MAX_ZOOM);
+            self.zoom = zoom.clamp(Self::MIN_ZOOM, self.max_zoom);
         }
     }
 
@@ -349,6 +377,27 @@ mod tests {
         assert_eq!(viewport.zoom(), Viewport::MIN_ZOOM);
         viewport.set_zoom(f32::MAX);
         assert_eq!(viewport.zoom(), Viewport::MAX_ZOOM);
+    }
+
+    #[test]
+    fn maximum_zoom_is_configurable_and_clamps_the_current_zoom() {
+        let mut viewport = Viewport::default().with_max_zoom(120.0);
+        viewport.set_zoom(100.0);
+        assert_eq!(viewport.zoom(), 100.0);
+        assert_eq!(viewport.max_zoom(), 120.0);
+
+        viewport.set_max_zoom(40.0);
+        assert_eq!(viewport.zoom(), 40.0);
+        assert_eq!(viewport.max_zoom(), 40.0);
+    }
+
+    #[test]
+    fn invalid_maximum_zoom_is_ignored() {
+        let mut viewport = Viewport::default();
+        for max_zoom in [f32::NAN, f32::INFINITY, 0.0, -1.0] {
+            viewport.set_max_zoom(max_zoom);
+        }
+        assert_eq!(viewport.max_zoom(), Viewport::MAX_ZOOM);
     }
 
     #[test]

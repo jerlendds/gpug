@@ -14,9 +14,9 @@ pub use crate::layout::{
 pub use crate::node::{Node, NodeId};
 pub use crate::renderer::{
     ConnectionLineAppearance, ConnectionLineContext, ConnectionLineRenderer, EdgeAppearance,
-    EdgePaintContext, EdgePathContext, EdgePathRenderer, EdgeTypeRenderer, EditorAction,
-    GraphRenderer, NodeAppearance, NodeContentRenderer, NodeRenderContext, NodeShape,
-    NodeTypeRenderer,
+    EdgeLabelContext, EdgeLabelRenderer, EdgePaintContext, EdgePathContext, EdgePathRenderer,
+    EdgeTypeRenderer, EditorAction, GraphRenderer, NodeAppearance, NodeContentRenderer,
+    NodeRenderContext, NodeShape, NodeTypeRenderer,
 };
 pub use crate::style::GraphStyle;
 pub mod connection;

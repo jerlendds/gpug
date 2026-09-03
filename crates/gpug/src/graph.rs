@@ -39,6 +39,140 @@ fn window_to_local(point: Point<Pixels>, origin: Point<Pixels>) -> Point<Pixels>
     gpui::point(point.x - origin.x, point.y - origin.y)
 }
 
+fn segment_intersects_bounds(start: WorldPoint, end: WorldPoint, bounds: WorldBounds) -> bool {
+    let min_x = bounds.origin.x;
+    let max_x = min_x + bounds.size.width;
+    let min_y = bounds.origin.y;
+    let max_y = min_y + bounds.size.height;
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let mut entry = 0.0_f32;
+    let mut exit = 1.0_f32;
+
+    for (p, q) in [
+        (-dx, start.x - min_x),
+        (dx, max_x - start.x),
+        (-dy, start.y - min_y),
+        (dy, max_y - start.y),
+    ] {
+        if p.abs() <= f32::EPSILON {
+            if q < 0.0 {
+                return false;
+            }
+            continue;
+        }
+        let ratio = q / p;
+        if p < 0.0 {
+            entry = entry.max(ratio);
+        } else {
+            exit = exit.min(ratio);
+        }
+        if entry > exit {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+fn reconnect_endpoint_hit(
+    position: Point<Pixels>,
+    endpoint: Point<Pixels>,
+    toward: Point<Pixels>,
+    edge_width_pixels: f32,
+    max_length_pixels: f32,
+) -> bool {
+    reconnect_endpoint_hit_distance(
+        position,
+        endpoint,
+        toward,
+        edge_width_pixels,
+        max_length_pixels,
+    )
+    .is_some()
+}
+
+fn reconnect_endpoint_hit_distance(
+    position: Point<Pixels>,
+    endpoint: Point<Pixels>,
+    toward: Point<Pixels>,
+    edge_width_pixels: f32,
+    max_length_pixels: f32,
+) -> Option<f32> {
+    let dx = (toward.x - endpoint.x) / px(1.0);
+    let dy = (toward.y - endpoint.y) / px(1.0);
+    let length = (dx * dx + dy * dy).sqrt();
+    if length <= 0.0001 {
+        return None;
+    }
+
+    let ux = dx / length;
+    let uy = dy / length;
+    let rx = (position.x - endpoint.x) / px(1.0);
+    let ry = (position.y - endpoint.y) / px(1.0);
+    let along = rx * ux + ry * uy;
+    let across = (rx * -uy + ry * ux).abs();
+    let half_width = edge_width_pixels.max(0.0) * 0.5 + RECONNECT_HIT_PADDING_PIXELS;
+
+    ((0.0..=length.min(max_length_pixels)).contains(&along) && across <= half_width)
+        .then_some(along)
+}
+
+#[cfg(test)]
+fn reconnect_path_end_hit(
+    position: Point<Pixels>,
+    path: &[Point<Pixels>],
+    from_start: bool,
+    edge_width_pixels: f32,
+    zoom: f32,
+) -> bool {
+    reconnect_path_end_distance(position, path, from_start, edge_width_pixels, zoom).is_some()
+}
+
+fn reconnect_path_end_distance(
+    position: Point<Pixels>,
+    path: &[Point<Pixels>],
+    from_start: bool,
+    edge_width_pixels: f32,
+    zoom: f32,
+) -> Option<f32> {
+    let mut remaining = reconnect_hit_length_pixels(zoom);
+    let mut traversed = 0.0;
+    let mut visit = |a: Point<Pixels>, b: Point<Pixels>| {
+        let dx = (b.x - a.x) / px(1.0);
+        let dy = (b.y - a.y) / px(1.0);
+        let length = (dx * dx + dy * dy).sqrt();
+        let hit = reconnect_endpoint_hit_distance(position, a, b, edge_width_pixels, remaining)
+            .map(|distance| traversed + distance);
+        remaining -= length.min(remaining);
+        traversed += length;
+        hit
+    };
+
+    if from_start {
+        path.windows(2).find_map(|pair| visit(pair[0], pair[1]))
+    } else {
+        path.windows(2)
+            .rev()
+            .find_map(|pair| visit(pair[1], pair[0]))
+    }
+}
+
+fn reconnect_hit_length_pixels(zoom: f32) -> f32 {
+    RECONNECT_HIT_LENGTH_PIXELS * zoom.max(1.0)
+}
+
+fn connection_handle_contains(
+    position: Point<Pixels>,
+    center: Point<Pixels>,
+    diameter: Pixels,
+) -> bool {
+    let dx = (position.x - center.x) / px(1.0);
+    let dy = (position.y - center.y) / px(1.0);
+    let radius = diameter * 0.5 / px(1.0);
+    dx * dx + dy * dy <= radius * radius
+}
+
 struct CachedNodeContent {
     renderer: Arc<dyn crate::renderer::NodeContentRenderer>,
     node: Node,
@@ -84,6 +218,10 @@ impl Render for NodeContentLayer {
 const CONNECTION_HANDLE_SIZE_WORLD: f32 = 0.7;
 const CONNECTION_HANDLE_GAP_WORLD: f32 = 0.5;
 const RECONNECT_HANDLE_SIZE_WORLD: f32 = 0.9;
+/// Length of the invisible target extending inward along each end of a selected edge.
+const RECONNECT_HIT_LENGTH_PIXELS: f32 = 2.0;
+/// Extra target width on each side of the rendered edge stroke.
+const RECONNECT_HIT_PADDING_PIXELS: f32 = 1.0;
 /// On-screen node height, in pixels, below which a rounded body degrades to a
 /// flat fill. Corner rounding and a one-pixel border are both sub-pixel below
 /// this, so the shaped quad costs shader work that resolves to nothing.
@@ -96,6 +234,7 @@ const MULTI_SELECTION_PADDING_PIXELS: f32 = 6.0;
 enum EdgeKind {
     Straight,
     Bezier,
+    Step,
     SmoothStep,
     Custom,
 }
@@ -115,7 +254,8 @@ impl EdgeKind {
         match kind {
             "default" | "straight" => Self::Straight,
             "bezier" | "simplebezier" => Self::Bezier,
-            "step" | "smoothstep" => Self::SmoothStep,
+            "step" => Self::Step,
+            "smoothstep" => Self::SmoothStep,
             _ => Self::Custom,
         }
     }
@@ -130,6 +270,60 @@ fn node_side_point(center: WorldPoint, size: crate::WorldSize, side: Position) -
     }
 }
 
+fn connection_edge_world_position(
+    center: WorldPoint,
+    size: crate::WorldSize,
+    side: Position,
+) -> WorldPoint {
+    let point = node_side_point(center, size, side);
+    let offset = CONNECTION_HANDLE_GAP_WORLD + CONNECTION_HANDLE_SIZE_WORLD * 0.5;
+    match side {
+        Position::Left => WorldPoint::new(point.x - offset, point.y),
+        Position::Right => WorldPoint::new(point.x + offset, point.y),
+        Position::Top => WorldPoint::new(point.x, point.y - offset),
+        Position::Bottom => WorldPoint::new(point.x, point.y + offset),
+    }
+}
+
+fn connection_geometry_size(
+    node_size: crate::WorldSize,
+    appearance: NodeAppearance,
+    zoom: f32,
+) -> crate::WorldSize {
+    match appearance.shape {
+        NodeShape::Square | NodeShape::Diamond if zoom.is_finite() && zoom > 0.0 => {
+            let diameter_world = appearance.radius_pixels.max(0.0) * 2.0 / zoom;
+            crate::WorldSize::new(diameter_world, diameter_world)
+        }
+        NodeShape::None | NodeShape::Rect { .. } | NodeShape::Square | NodeShape::Diamond => {
+            node_size
+        }
+    }
+}
+
+fn self_loop_path(source: WorldPoint, target: WorldPoint) -> Vec<WorldPoint> {
+    let extent = ((source.y - target.y).abs() * 1.5).max(10.0);
+    let c1 = WorldPoint::new(source.x + extent, source.y + extent * 0.5);
+    let c2 = WorldPoint::new(target.x + extent, target.y - extent * 0.5);
+    (0..=24)
+        .map(|index| {
+            let t = index as f32 / 24.0;
+            let u = 1.0 - t;
+            WorldPoint::new(
+                source.x * (u * u * u)
+                    + c1.x * (3.0 * u * u * t)
+                    + c2.x * (3.0 * u * t * t)
+                    + target.x * (t * t * t),
+                source.y * (u * u * u)
+                    + c1.y * (3.0 * u * u * t)
+                    + c2.y * (3.0 * u * t * t)
+                    + target.y * (t * t * t),
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn facing_sides(source: WorldPoint, target: WorldPoint) -> (Position, Position) {
     let dx = target.x - source.x;
     let dy = target.y - source.y;
@@ -152,7 +346,7 @@ fn facing_sides(source: WorldPoint, target: WorldPoint) -> (Position, Position) 
 #[derive(Default)]
 struct SceneCache {
     specs: Option<(u64, u64, u64)>,
-    motion: Option<(u64, u64, u64)>,
+    motion: Option<(u64, u64, u64, u32)>,
     appearance: Option<AppearanceRevision>,
     selection: Option<(u64, u64)>,
     hidden: Rc<[bool]>,
@@ -392,6 +586,8 @@ pub struct GraphBuilder {
     ownership: GraphOwnership,
     data_api: GraphDataApi,
     connection_validator: Option<crate::ConnectionValidator>,
+    default_edge_marker_start: Option<EdgeMarker>,
+    default_edge_marker_end: Option<EdgeMarker>,
 }
 
 impl Default for GraphBuilder {
@@ -404,7 +600,7 @@ impl Default for GraphBuilder {
             viewport: Viewport::default(),
             interactive_layout: false,
             fit_on_load: false,
-            show_handles: false,
+            show_handles: true,
             target_handle_position: Position::Left,
             source_handle_position: Position::Right,
             show_resize_handles: false,
@@ -420,6 +616,8 @@ impl Default for GraphBuilder {
             auto_pan_margin: Graph::DEFAULT_AUTO_PAN_MARGIN,
             data_api: GraphDataApi::default(),
             connection_validator: None,
+            default_edge_marker_start: None,
+            default_edge_marker_end: Some(EdgeMarker::ArrowClosed),
         }
     }
 }
@@ -479,8 +677,30 @@ impl GraphBuilder {
         self
     }
 
+    /// Sets the markers used by edges created through handle-drag gestures.
+    ///
+    /// This does not modify edges supplied in [`GraphData`]. By default,
+    /// gesture-created edges use no start marker and a closed-arrow end marker.
+    pub fn default_edge_markers(
+        mut self,
+        start: Option<EdgeMarker>,
+        end: Option<EdgeMarker>,
+    ) -> Self {
+        self.default_edge_marker_start = start;
+        self.default_edge_marker_end = end;
+        self
+    }
+
     pub fn viewport(mut self, viewport: Viewport) -> Self {
         self.viewport = viewport;
+        self
+    }
+
+    /// Sets the maximum viewport scale in screen pixels per world unit.
+    ///
+    /// The default is [`Viewport::MAX_ZOOM`] (60×). Invalid values are ignored.
+    pub fn max_zoom(mut self, max_zoom: f32) -> Self {
+        self.viewport.set_max_zoom(max_zoom);
         self
     }
 
@@ -494,7 +714,8 @@ impl GraphBuilder {
         self
     }
 
-    /// Keeps connection handles visible even when their node is not selected.
+    /// Controls whether connection handles remain visible when their node is
+    /// not selected. Handles are visible by default.
     pub fn show_handles(mut self, visible: bool) -> Self {
         self.show_handles = visible;
         self
@@ -580,6 +801,7 @@ pub struct Graph {
     pan_drag_position: Option<Point<Pixels>>,
     pointer_over_graph_item: bool,
     pointer_over_handle: bool,
+    pointer_over_reconnect: bool,
     smooth_zoom: Option<SmoothZoom>,
     gestures: GestureRouter,
     selection_start: Option<Point<Pixels>>,
@@ -589,6 +811,8 @@ pub struct Graph {
     focus: FocusHandle,
     connection: ConnectionController,
     next_edge_id: u64,
+    default_edge_marker_start: Option<EdgeMarker>,
+    default_edge_marker_end: Option<EdgeMarker>,
     events: Vec<GraphEvent>,
     announcement: String,
     resize_node: Option<(usize, crate::NodeResizeControl)>,
@@ -700,6 +924,7 @@ impl Graph {
             pan_drag_position: None,
             pointer_over_graph_item: false,
             pointer_over_handle: false,
+            pointer_over_reconnect: false,
             smooth_zoom: None,
             gestures: GestureRouter::default(),
             selection_start: None,
@@ -709,6 +934,8 @@ impl Graph {
             focus: cx.focus_handle().tab_stop(true),
             connection,
             next_edge_id,
+            default_edge_marker_start: builder.default_edge_marker_start,
+            default_edge_marker_end: builder.default_edge_marker_end,
             events: Vec::new(),
             announcement: String::new(),
             resize_node: None,
@@ -798,6 +1025,50 @@ impl Graph {
         Ok(())
     }
 
+    /// Replaces one directed edge with two edges routed through `node`.
+    ///
+    /// The source half retains the original edge ID and appearance. The target
+    /// half receives `new_edge_id` and otherwise copies the original edge's
+    /// configuration. The operation is validated and committed atomically.
+    pub fn split_edge_at_node(
+        &mut self,
+        edge_id: crate::EdgeId,
+        node: NodeId,
+        new_edge_id: impl Into<u64>,
+    ) -> Result<bool, GraphDataError> {
+        let Some(edge) = self.model.edges.iter().find(|edge| edge.id == edge_id) else {
+            return Ok(false);
+        };
+        if !self
+            .model
+            .nodes
+            .iter()
+            .any(|candidate| candidate.id == node)
+        {
+            return Ok(false);
+        }
+
+        let mut source_half = edge.clone();
+        source_half.target = node;
+        source_half.target_handle = None;
+        let mut target_half = edge.clone();
+        target_half.id = crate::EdgeId(new_edge_id.into());
+        target_half.source = node;
+        target_half.source_handle = None;
+        let changes = [
+            EdgeChange::Replace {
+                id: edge_id,
+                item: source_half,
+            },
+            EdgeChange::Add {
+                index: None,
+                item: target_half,
+            },
+        ];
+        self.model.emit_graph_changes([], changes)?;
+        Ok(true)
+    }
+
     pub fn nodes(&self) -> &[Node] {
         &self.model.nodes
     }
@@ -847,6 +1118,45 @@ impl Graph {
     /// Returns the measured rectangle occupied by a node in world space.
     pub fn node_bounds(&self, id: NodeId) -> Option<WorldBounds> {
         self.model.store.runtimes.get(&id).map(NodeRuntime::bounds)
+    }
+
+    /// Finds visible edges whose rendered path intersects a world-space area.
+    ///
+    /// Curved and custom routes use the same sampled geometry as painting.
+    /// Straight routes use their endpoint segment. Touching the area boundary
+    /// counts as an intersection.
+    pub fn intersecting_edges(&self, area: WorldBounds) -> HashSet<crate::EdgeId> {
+        self.model
+            .edges
+            .iter()
+            .enumerate()
+            .filter_map(|(index, edge)| {
+                let source = self.model.node(edge.source)?;
+                let target = self.model.node(edge.target)?;
+                if source.hidden || target.hidden {
+                    return None;
+                }
+                let intersects = self
+                    .scene
+                    .edge_geometries
+                    .get(index)
+                    .and_then(Option::as_deref)
+                    .map_or_else(
+                        || {
+                            segment_intersects_bounds(
+                                self.node_center(source),
+                                self.node_center(target),
+                                area,
+                            )
+                        },
+                        |path| {
+                            path.windows(2)
+                                .any(|pair| segment_intersects_bounds(pair[0], pair[1], area))
+                        },
+                    );
+                intersects.then_some(edge.id)
+            })
+            .collect()
     }
 
     /// Starts a custom resize gesture at a world-space pointer position.

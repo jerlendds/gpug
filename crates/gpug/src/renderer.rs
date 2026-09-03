@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use gpui::AnyElement;
+use gpui::{AnyElement, Pixels, Point};
 
 use crate::{
     Diagnostic, Edge, EdgeId, GraphStyle, HandleKey, Node, NodeId, NodeRuntime,
@@ -139,6 +139,32 @@ pub trait EdgeTypeRenderer: Send + Sync {
     fn appearance(&self, edge: &Edge, style: &GraphStyle) -> EdgeAppearance;
 }
 
+/// Screen-space anchors available to a custom edge-label renderer.
+///
+/// The graph owns endpoint geometry and viewport transforms. Renderers can use
+/// these anchors to place one or more labels without duplicating that logic.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EdgeLabelContext {
+    pub source: Point<Pixels>,
+    pub midpoint: Point<Pixels>,
+    pub target: Point<Pixels>,
+    /// Current world-to-screen scale, in pixels per world unit.
+    pub zoom: f32,
+}
+
+pub trait EdgeLabelRenderer: Send + Sync {
+    fn render(&self, edge: &Edge, context: EdgeLabelContext) -> AnyElement;
+}
+
+impl<F> EdgeLabelRenderer for F
+where
+    F: Fn(&Edge, EdgeLabelContext) -> AnyElement + Send + Sync,
+{
+    fn render(&self, edge: &Edge, context: EdgeLabelContext) -> AnyElement {
+        self(edge, context)
+    }
+}
+
 impl<F> NodeTypeRenderer for F
 where
     F: Fn(&Node, f32, &GraphStyle) -> NodeAppearance + Send + Sync,
@@ -164,6 +190,7 @@ pub struct GraphRenderer {
     cached_node_contents: Arc<HashSet<String>>,
     edge_types: Arc<HashMap<String, Arc<dyn EdgeTypeRenderer>>>,
     edge_paths: Arc<HashMap<String, Arc<dyn EdgePathRenderer>>>,
+    edge_label: Option<Arc<dyn EdgeLabelRenderer>>,
     connection_line: Option<Arc<dyn ConnectionLineRenderer>>,
     diagnostics: Option<SharedDiagnosticSink>,
     reported: Arc<Mutex<HashSet<String>>>,
@@ -298,6 +325,17 @@ impl GraphRenderer {
         renderer: impl EdgePathRenderer + 'static,
     ) {
         Arc::make_mut(&mut self.edge_paths).insert(name.into(), Arc::new(renderer));
+    }
+
+    /// Replaces the standard midpoint edge labels. The returned element is
+    /// painted in the graph overlay and may use any of the supplied
+    /// screen-space anchors for absolute positioning.
+    pub fn set_edge_label_renderer(&mut self, renderer: impl EdgeLabelRenderer + 'static) {
+        self.edge_label = Some(Arc::new(renderer));
+    }
+
+    pub(crate) fn edge_label_renderer(&self) -> Option<Arc<dyn EdgeLabelRenderer>> {
+        self.edge_label.clone()
     }
 
     pub(crate) fn edge_path(
@@ -452,6 +490,7 @@ mod tests {
         let node = Node::new(1u64, WorldPoint::ZERO).with_type("unknown");
         assert_eq!(renderer.node_appearance(&node, 1.0).color, 7);
     }
+
     #[test]
     fn unknown_type_diagnostic_is_reported_once() {
         let reports = Arc::new(AtomicUsize::new(0));

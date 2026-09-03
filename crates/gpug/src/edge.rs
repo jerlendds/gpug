@@ -54,7 +54,8 @@ pub struct Edge {
 }
 
 impl Edge {
-    pub const DEFAULT_INTERACTION_WIDTH: f32 = 20.0;
+    /// Default width, in screen pixels, of the clickable corridor around an edge.
+    pub const DEFAULT_INTERACTION_WIDTH: f32 = 2.0;
 
     /// Creates an edge with a process-local, automatically allocated ID.
     ///
