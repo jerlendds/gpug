@@ -1,3 +1,4 @@
+mod clock;
 pub use crate::generators::erdos_renyi::{
     generate_erdos_renyi_graph, generate_erdos_renyi_graph_with_seed, ErdosRenyi,
 };

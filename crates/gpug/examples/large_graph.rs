@@ -1,5 +1,6 @@
+#![cfg_attr(target_family = "wasm", no_main)]
 use gpug::*;
-use gpui::{App, AppContext, Application, WindowOptions};
+use gpui::{App, AppContext, WindowOptions};
 
 mod support;
 use support::ExampleView;
@@ -12,7 +13,7 @@ use support::ExampleView;
 /// - `GPUG_EDGE_BUDGET` edges drawn per frame while the layout animates
 /// - `GPUG_ANIMATE=0` opens paused instead of running the layout
 fn env<T: std::str::FromStr>(key: &str, fallback: T) -> T {
-    std::env::var(key)
+    support::env_var(key)
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(fallback)
@@ -23,7 +24,7 @@ fn main() {
     let probability = env("GPUG_EDGE_PROBABILITY", 0.00001f64);
     let edge_budget = env("GPUG_EDGE_BUDGET", 20_000usize);
     let animate = env("GPUG_ANIMATE", 1u32) != 0;
-    Application::new().run(move |cx: &mut App| {
+    support::Application::new().run(move |cx: &mut App| {
         let options = WindowOptions {
             app_id: Some("GPUG Large Graph".to_string()),
             ..Default::default()

@@ -1,7 +1,41 @@
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_family = "wasm"))]
+pub use std::time::Instant;
+#[cfg(target_family = "wasm")]
+pub use web_time::Instant;
+
+#[cfg(not(target_family = "wasm"))]
+pub use gpui::Application;
+#[cfg(target_family = "wasm")]
+#[path = "../../../../web/application.rs"]
+mod web_application;
+#[cfg(target_family = "wasm")]
+pub use web_application::Application;
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    super::main();
+}
+
+/// Native environment variables become URL query parameters in the browser.
+pub fn env_var(key: &str) -> Result<String, std::env::VarError> {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        std::env::var(key)
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        web_sys::window()
+            .and_then(|window| window.location().search().ok())
+            .and_then(|query| web_sys::UrlSearchParams::new_with_str(&query).ok())
+            .and_then(|params| params.get(key))
+            .ok_or(std::env::VarError::NotPresent)
+    }
+}
 
 use gpug::Graph;
 use gpug::{
@@ -9,8 +43,8 @@ use gpug::{
     Position, WorldPoint, WorldSize,
 };
 use gpui::{
-    canvas, div, prelude::*, px, rgb, App, AppContext, Application, Context, Entity, IntoElement,
-    Render, Window, WindowOptions,
+    canvas, div, prelude::*, px, rgb, App, AppContext, Context, Entity, IntoElement, Render,
+    Window, WindowOptions,
 };
 
 fn square_node(_: &Node, _: f32, _: &gpug::GraphStyle) -> NodeAppearance {

@@ -140,7 +140,7 @@ impl Graph {
             return false;
         }
         let edge = (delta.x.signum() as i8, delta.y.signum() as i8);
-        let now = std::time::Instant::now();
+        let now = crate::clock::Instant::now();
         let elapsed = match self.auto_pan_edge_since {
             Some((active_edge, since))
                 if active_edge == edge

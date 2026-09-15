@@ -1,10 +1,12 @@
+#![cfg_attr(target_family = "wasm", no_main)]
 //! A paint-time edge animation gallery.
+mod support;
 use gpui::{
-    canvas, div, fill, point, px, rgb, rgba, size, App, AppContext, Application, Bounds, Context,
+    canvas, div, fill, point, px, rgb, rgba, size, App, AppContext, Bounds, Context,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, Path, Pixels, Point, Render, Styled, Window, WindowOptions,
 };
-use std::time::Instant;
+use support::Instant;
 
 const NODES: [(f32, f32); 8] = [
     (0.10, 0.18),
@@ -282,7 +284,7 @@ impl Render for AnimationGallery {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    support::Application::new().run(|cx: &mut App| {
         cx.open_window(
             WindowOptions {
                 app_id: Some("GPUG — Animating Edges".into()),

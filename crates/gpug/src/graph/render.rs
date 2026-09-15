@@ -168,7 +168,7 @@ impl Render for Graph {
         // nothing to keep up with.
         let governor_stride = match style.frame_budget_ms {
             Some(target_ms) if self.is_rendering_continuously() => {
-                let now = std::time::Instant::now();
+                let now = crate::clock::Instant::now();
                 if let Some(previous) = self.last_frame.replace(now) {
                     self.last_frame_ms = now.duration_since(previous).as_secs_f32() * 1_000.0;
                     self.governor.observe(self.last_frame_ms, target_ms);
@@ -243,8 +243,8 @@ impl Render for Graph {
             (self.canvas_origin().y / px(1.0)).to_bits(),
         );
         // Level-of-detail selection for element content. A node renders its
-        // registered element tree only while it is large enough on screen for
-        // that detail to be legible, and only while the frame's budget lasts.
+        // registered element tree when large enough on screen, or near maximum
+        // zoom, and only while the frame's content budget lasts.
         // Every other node keeps its position, size, and colors and is drawn
         // from the scene columns instead, so nothing disappears - the
         // representation gets cheaper, the graph does not get emptier.
@@ -257,7 +257,7 @@ impl Render for Graph {
             visible_nodes.as_deref().map(Vec::as_slice),
             &node_sizes,
             viewport.zoom(),
-            style.content_lod_min_pixels,
+            style.content_min_pixels_at_zoom(viewport.zoom(), viewport.max_zoom()),
             style.content_budget,
             Rc::make_mut(&mut self.content_drawn),
         );
@@ -1102,11 +1102,25 @@ impl Render for Graph {
                             px((geometry_size.width * viewport.zoom()).max(1.0)),
                             px((geometry_size.height * viewport.zoom()).max(1.0)),
                         );
-                        window.paint_quad(outline(
-                            Bounds::centered_at(center, selection_size),
-                            rgb(style.selection_color),
-                            BorderStyle::default(),
-                        ));
+                        let rectangle = Bounds::centered_at(center, selection_size);
+                        // Keep the overlay's geometry outside the node interior:
+                        // transparent full-size quads can occlude later content
+                        // on backends that write depth for transparent fragments.
+                        let border = px(1.0);
+                        for strip in [
+                            Bounds::new(rectangle.origin, size(selection_size.width, border)),
+                            Bounds::new(
+                                point(rectangle.origin.x, rectangle.bottom() - border),
+                                size(selection_size.width, border),
+                            ),
+                            Bounds::new(rectangle.origin, size(border, selection_size.height)),
+                            Bounds::new(
+                                point(rectangle.right() - border, rectangle.origin.y),
+                                size(border, selection_size.height),
+                            ),
+                        ] {
+                            window.paint_quad(fill(strip, rgb(style.selection_color)));
+                        }
                         if !show_handles {
                             let handle_size = px(CONNECTION_HANDLE_SIZE_WORLD * viewport.zoom());
                             for kind in [HandleKind::Target, HandleKind::Source] {
@@ -1455,7 +1469,10 @@ impl Render for Graph {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|graph, event: &MouseDownEvent, window, cx| {
+                    #[cfg(not(target_family = "wasm"))]
                     graph.focus.focus(window);
+                    #[cfg(target_family = "wasm")]
+                    graph.focus.focus(window, cx);
                     if let Some((index, direction)) =
                         graph.resize_at_screen_position(event.position)
                     {

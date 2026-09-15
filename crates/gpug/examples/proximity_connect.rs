@@ -1,10 +1,12 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+mod support;
 use gpug::{
     Edge, Graph, GraphData, GraphRenderer, Node, NodeAppearance, NodeId, NodeShape, WorldBounds,
     WorldPoint, WorldSize,
 };
 use gpui::{
-    canvas, div, prelude::*, px, rgb, App, AppContext, Application, Context, Entity, IntoElement,
-    Render, Window, WindowOptions,
+    canvas, div, prelude::*, px, rgb, App, AppContext, Context, Entity, IntoElement, Render,
+    Window, WindowOptions,
 };
 
 const NODE_SIZE: WorldSize = WorldSize::new(9.0, 9.0);
@@ -216,7 +218,7 @@ impl Render for ExampleView {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    support::Application::new().run(|cx: &mut App| {
         cx.open_window(
             WindowOptions {
                 app_id: Some("GPUG — Proximity Connect".into()),

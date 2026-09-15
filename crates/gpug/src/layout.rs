@@ -1,4 +1,5 @@
-use std::time::{Duration, Instant};
+use crate::clock::Instant;
+use std::time::Duration;
 
 use crate::coordinates::{LayoutPoint, WorldBounds, WorldPoint};
 use crate::data::LayoutEdge;
@@ -341,7 +342,7 @@ mod budget_tests {
             steps: 0,
         };
         let mut positions = vec![WorldPoint::ZERO; 4];
-        let started = std::time::Instant::now();
+        let started = crate::clock::Instant::now();
         step_with_budget(&mut layout, &mut positions, &[], Duration::from_millis(10));
         let elapsed = started.elapsed();
 

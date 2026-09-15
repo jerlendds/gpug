@@ -1,9 +1,11 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+mod support;
 use gpug::{
     Edge, Graph, GraphData, GraphRenderer, Node, NodeAppearance, NodeShape, WorldPoint, WorldSize,
 };
 use gpui::{
-    div, prelude::*, px, rgb, App, AppContext, Application, Context, Entity, FocusHandle,
-    Focusable, KeyDownEvent, MouseButton, MouseDownEvent, Render, Window, WindowOptions,
+    div, prelude::*, px, rgb, App, AppContext, Context, Entity, FocusHandle, Focusable,
+    KeyDownEvent, MouseButton, MouseDownEvent, Render, Window, WindowOptions,
 };
 
 const EDITABLE_NODE: &str = "editable-node";
@@ -137,7 +139,10 @@ impl Render for TextInput {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|input, _: &MouseDownEvent, window, cx| {
+                    #[cfg(not(target_family = "wasm"))]
                     input.focus.focus(window);
+                    #[cfg(target_family = "wasm")]
+                    input.focus.focus(window, cx);
                     cx.stop_propagation();
                     cx.notify();
                 }),
@@ -239,7 +244,7 @@ fn make_node(id: u64, x: f32, label: &str, color: &str) -> Node {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    support::Application::new().run(|cx: &mut App| {
         cx.open_window(
             WindowOptions {
                 app_id: Some("GPUG — Updating Nodes".into()),

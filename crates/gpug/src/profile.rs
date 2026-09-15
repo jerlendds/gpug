@@ -7,9 +7,9 @@
 //! Set `GPUG_PROFILE_INTERVAL` to change how many frames are accumulated
 //! before a report is written to stderr (default 120).
 
+use crate::clock::Instant;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::time::Instant;
 
 /// A phase of one graph frame. Ordering matches the order phases run in, so a
 /// report reads top to bottom like a frame timeline.

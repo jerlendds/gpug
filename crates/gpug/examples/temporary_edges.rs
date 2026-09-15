@@ -1,10 +1,11 @@
+#![cfg_attr(target_family = "wasm", no_main)]
 mod support;
 
 use gpug::{Graph, GraphData, Node, WorldPoint, WorldSize};
-use gpui::{App, AppContext, Application, WindowOptions};
+use gpui::{App, AppContext, WindowOptions};
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    support::Application::new().run(|cx: &mut App| {
         cx.open_window(
             WindowOptions {
                 app_id: Some("GPUG — Temporary Edges".into()),

@@ -1,9 +1,11 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+mod support;
 use gpug::{
     Graph, GraphData, GraphRenderer, Node, NodeAppearance, NodeShape, Position, WorldPoint,
     WorldSize,
 };
 use gpui::{
-    canvas, div, prelude::*, px, rgb, App, AppContext, Application, Context, Entity, MouseButton,
+    canvas, div, prelude::*, px, rgb, App, AppContext, Context, Entity, MouseButton,
     MouseDownEvent, Render, Window, WindowOptions,
 };
 
@@ -253,7 +255,7 @@ impl Render for NodeToolbarExample {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    support::Application::new().run(|cx: &mut App| {
         cx.open_window(
             WindowOptions {
                 app_id: Some("GPUG — Node Toolbar".into()),

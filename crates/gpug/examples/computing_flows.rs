@@ -1,12 +1,14 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+mod support;
 use gpug::{
     Edge, EdgeMarker, Graph, GraphData, GraphDataApi, GraphRenderer, HandleKind, Node,
     NodeAppearance, NodeId, NodeShape, WorldPoint, WorldSize,
 };
 use gpui::{
-    div, fill, point, px, rgb, size, App, AppContext, Application, Bounds, ContentMask, Context,
-    Element, ElementId, Entity, FocusHandle, Focusable, GlobalElementId, InteractiveElement,
-    IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, PaintQuad, ParentElement,
-    Pixels, Render, ShapedLine, SharedString, Style, Styled, TextRun, Window, WindowOptions,
+    div, fill, point, px, rgb, size, App, AppContext, Bounds, ContentMask, Context, Element,
+    ElementId, Entity, FocusHandle, Focusable, GlobalElementId, InteractiveElement, IntoElement,
+    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, PaintQuad, ParentElement, Pixels, Render,
+    ShapedLine, SharedString, Style, Styled, TextRun, Window, WindowOptions,
 };
 
 const NODE_ONE: NodeId = NodeId(1);
@@ -69,7 +71,10 @@ impl FlowInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(not(target_family = "wasm"))]
         self.focus.focus(window);
+        #[cfg(target_family = "wasm")]
+        self.focus.focus(window, cx);
         if let (Some(bounds), Some(line)) = (self.last_bounds, self.last_layout.as_ref()) {
             self.cursor =
                 line.closest_index_for_x(event.position.x - bounds.left() + self.scroll_x);
@@ -265,6 +270,10 @@ impl Element for FlowTextElement {
                 .paint(
                     point(bounds.left() - prepaint.scroll_x, bounds.top()),
                     bounds.size.height,
+                    #[cfg(target_family = "wasm")]
+                    gpui::TextAlign::Left,
+                    #[cfg(target_family = "wasm")]
+                    None,
                     window,
                     cx,
                 )
@@ -300,7 +309,7 @@ fn card(title: &str, zoom: f32, body: impl IntoElement) -> impl IntoElement {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    support::Application::new().run(|cx: &mut App| {
         cx.open_window(
             WindowOptions {
                 app_id: Some("GPUG — Computing Flows".into()),

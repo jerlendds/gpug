@@ -822,11 +822,11 @@ pub struct Graph {
     auto_pan: bool,
     auto_pan_speed: f32,
     auto_pan_margin: f32,
-    auto_pan_edge_since: Option<((i8, i8), std::time::Instant)>,
+    auto_pan_edge_since: Option<((i8, i8), crate::clock::Instant)>,
     edge_geometry_cache: crate::GeometryCache<Vec<WorldPoint>>,
     /// Closed-loop edge level of detail, and the clock it is driven from.
     governor: crate::DetailGovernor,
-    last_frame: Option<std::time::Instant>,
+    last_frame: Option<crate::clock::Instant>,
     /// Duration of the previous frame and of the layout work inside it. The
     /// difference is the fixed cost a frame owes to everything that is not
     /// simulation, which is what the layout's slice of the deadline is

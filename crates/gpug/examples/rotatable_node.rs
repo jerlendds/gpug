@@ -1,11 +1,13 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+mod support;
 use std::borrow::Cow;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    canvas, div, point, px, radians, rgb, size, svg, App, AppContext, Application, AssetSource,
-    Bounds, Context, CursorStyle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent,
-    SharedString, Styled, Transformation, Window, WindowOptions,
+    canvas, div, point, px, radians, rgb, size, svg, App, AppContext, AssetSource, Bounds, Context,
+    CursorStyle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString, Styled,
+    Transformation, Window, WindowOptions,
 };
 
 const NODE_SIZE: f32 = 240.0;
@@ -321,27 +323,29 @@ impl Render for RotatableNodeExample {
 }
 
 fn main() {
-    Application::new().with_assets(Assets).run(|cx: &mut App| {
-        cx.open_window(WindowOptions::default(), |_, cx| {
-            cx.new(|_| RotatableNodeExample {
-                nodes: [
-                    NodeState {
-                        position: point(-110.0, 0.0),
-                        rotation: 0.0,
-                    },
-                    NodeState {
-                        position: point(110.0, 0.0),
-                        rotation: 0.0,
-                    },
-                ],
-                zoom: 1.0,
-                pan: point(px(0.0), px(0.0)),
-                gesture: None,
+    support::Application::new()
+        .with_assets(Assets)
+        .run(|cx: &mut App| {
+            cx.open_window(WindowOptions::default(), |_, cx| {
+                cx.new(|_| RotatableNodeExample {
+                    nodes: [
+                        NodeState {
+                            position: point(-110.0, 0.0),
+                            rotation: 0.0,
+                        },
+                        NodeState {
+                            position: point(110.0, 0.0),
+                            rotation: 0.0,
+                        },
+                    ],
+                    zoom: 1.0,
+                    pan: point(px(0.0), px(0.0)),
+                    gesture: None,
+                })
             })
-        })
-        .unwrap();
-        cx.activate(true);
-    });
+            .unwrap();
+            cx.activate(true);
+        });
 }
 
 #[cfg(test)]

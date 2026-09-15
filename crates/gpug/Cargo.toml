@@ -18,6 +18,7 @@ doctest = false
 [dependencies]
 gpui.workspace = true
 rayon = "1.10"
+vortex = "0.86.1"
 
 [[example]]
 name = "kitchen_sink"

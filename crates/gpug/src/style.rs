@@ -20,6 +20,11 @@ pub struct GraphStyle {
     /// and text shaping per node per frame; a quad costs one instance in a
     /// buffer, and at these sizes the two are visually indistinguishable.
     pub content_lod_min_pixels: f32,
+    /// Fraction of the viewport's configured maximum zoom at which registered
+    /// node content becomes eligible regardless of its projected size. The
+    /// content budget and visibility checks still apply. Defaults to 0.9; values
+    /// outside (0, 1] fall back to that default.
+    pub content_full_detail_zoom_ratio: f32,
     /// Largest number of nodes that may render element content in one frame.
     ///
     /// This bounds the worst case when a viewer zooms far enough in that many
@@ -49,6 +54,7 @@ impl Default for GraphStyle {
             hit_radius_pixels: 8.0,
             interactive_edge_budget: 15_000,
             content_lod_min_pixels: 18.0,
+            content_full_detail_zoom_ratio: 0.9,
             content_budget: 512,
             edge_lod_min_pixels: 2.0,
             frame_budget_ms: Some(1_000.0 / 60.0),
@@ -67,9 +73,23 @@ impl GraphStyle {
             finite_non_negative_or(self.hit_radius_pixels, defaults.hit_radius_pixels);
         self.content_lod_min_pixels =
             finite_non_negative_or(self.content_lod_min_pixels, defaults.content_lod_min_pixels);
+        if !self.content_full_detail_zoom_ratio.is_finite()
+            || self.content_full_detail_zoom_ratio <= 0.0
+            || self.content_full_detail_zoom_ratio > 1.0
+        {
+            self.content_full_detail_zoom_ratio = defaults.content_full_detail_zoom_ratio;
+        }
         self.edge_lod_min_pixels =
             finite_non_negative_or(self.edge_lod_min_pixels, defaults.edge_lod_min_pixels);
         self
+    }
+
+    pub(crate) fn content_min_pixels_at_zoom(&self, zoom: f32, max_zoom: f32) -> f32 {
+        if zoom >= max_zoom * self.content_full_detail_zoom_ratio {
+            0.0
+        } else {
+            self.content_lod_min_pixels
+        }
     }
 }
 
@@ -104,5 +124,29 @@ mod tests {
     #[test]
     fn default_edges_are_two_pixels_wide() {
         assert_eq!(GraphStyle::default().edge_width_pixels, 2.0);
+    }
+
+    #[test]
+    fn close_zoom_restores_content_eligibility_relative_to_configured_maximum() {
+        let style = GraphStyle::default();
+        for maximum in [0.5, 1.0, 4.0, 20.0] {
+            assert_eq!(
+                style.content_min_pixels_at_zoom(maximum * 0.89, maximum),
+                18.0
+            );
+            assert_eq!(
+                style.content_min_pixels_at_zoom(maximum * 0.9, maximum),
+                0.0
+            );
+            assert_eq!(style.content_min_pixels_at_zoom(maximum, maximum), 0.0);
+        }
+        for invalid in [f32::NAN, f32::INFINITY, -1.0, 0.0, 1.1] {
+            let style = GraphStyle {
+                content_full_detail_zoom_ratio: invalid,
+                ..GraphStyle::default()
+            }
+            .sanitized();
+            assert_eq!(style.content_full_detail_zoom_ratio, 0.9);
+        }
     }
 }

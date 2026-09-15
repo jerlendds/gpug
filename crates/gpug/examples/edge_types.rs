@@ -1,3 +1,4 @@
+#![cfg_attr(target_family = "wasm", no_main)]
 mod support;
 
 catalog_example!(support::CatalogExample::new(

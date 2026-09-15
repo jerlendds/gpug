@@ -1,10 +1,10 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+mod support;
 use gpug::{
     Edge, Graph, GraphData, GraphRenderer, Node, NodeAppearance, NodeShape, WorldBounds,
     WorldPoint, WorldSize,
 };
-use gpui::{
-    div, px, rgb, App, AppContext, Application, IntoElement, ParentElement, Styled, WindowOptions,
-};
+use gpui::{div, px, rgb, App, AppContext, IntoElement, ParentElement, Styled, WindowOptions};
 
 const NODE_SIZE: WorldSize = WorldSize::new(18.0, 10.0);
 const DRAG_HANDLE: WorldBounds =
@@ -44,7 +44,7 @@ fn example_data() -> GraphData {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    support::Application::new().run(|cx: &mut App| {
         cx.open_window(
             WindowOptions {
                 app_id: Some("GPUG — Easy Connect".into()),

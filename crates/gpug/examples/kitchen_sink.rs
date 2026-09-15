@@ -1,8 +1,10 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+mod support;
 use gpug::*;
-use gpui::{App, AppContext, Application, WindowOptions};
+use gpui::{App, AppContext, WindowOptions};
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    support::Application::new().run(|cx: &mut App| {
         let window_opts = WindowOptions {
             app_id: Some("GPUG Kitchen Sink".to_string()),
             ..Default::default()

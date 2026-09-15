@@ -1,13 +1,15 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+mod support;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use support::Instant;
 
 use gpug::{
     Edge, Graph, GraphData, GraphRenderer, Node, NodeAppearance, NodeShape, WorldPoint, WorldSize,
 };
 use gpui::{
-    canvas, div, point, px, rgb, rgba, App, AppContext, Application, Context, Entity, FocusHandle,
-    Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    ParentElement, Path, Pixels, Point, Render, Styled, Window, WindowOptions,
+    canvas, div, point, px, rgb, rgba, App, AppContext, Context, Entity, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
+    Path, Pixels, Point, Render, Styled, Window, WindowOptions,
 };
 
 #[derive(Clone)]
@@ -51,7 +53,10 @@ impl HexInput {
     }
 
     fn mouse_down(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(not(target_family = "wasm"))]
         self.focus.focus(window);
+        #[cfg(target_family = "wasm")]
+        self.focus.focus(window, cx);
         cx.stop_propagation();
         cx.notify();
     }
@@ -301,7 +306,7 @@ impl Render for CustomNodes {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    support::Application::new().run(|cx: &mut App| {
         cx.open_window(
             WindowOptions {
                 app_id: Some("GPUG — Custom Nodes".into()),

@@ -1,10 +1,12 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+mod support;
 use gpug::{
     Edge, EdgeId, Graph, GraphData, GraphRenderer, Node, NodeAppearance, NodeId, NodeShape,
     WorldPoint, WorldSize,
 };
 use gpui::{
-    canvas, div, prelude::*, px, rgb, App, AppContext, Application, Context, Entity, IntoElement,
-    Render, Window, WindowOptions,
+    canvas, div, prelude::*, px, rgb, App, AppContext, Context, Entity, IntoElement, Render,
+    Window, WindowOptions,
 };
 
 const NODE_C: NodeId = NodeId(3);
@@ -133,7 +135,7 @@ impl Render for ExampleView {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    support::Application::new().run(|cx: &mut App| {
         cx.open_window(
             WindowOptions {
                 app_id: Some("GPUG — Edge Intersection".into()),

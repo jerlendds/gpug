@@ -1,3 +1,5 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+mod support;
 use std::borrow::Cow;
 
 use gpug::{
@@ -5,9 +7,9 @@ use gpug::{
     WorldPoint, WorldSize,
 };
 use gpui::{
-    canvas, div, point, prelude::*, px, rgb, svg, App, AppContext, Application, AssetSource,
-    Bounds, Context, Entity, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathBuilder, Pixels, Point, Render, SharedString, Window, WindowOptions,
+    canvas, div, point, prelude::*, px, rgb, svg, App, AppContext, AssetSource, Bounds, Context,
+    Entity, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point,
+    Render, SharedString, Window, WindowOptions,
 };
 
 const SIDEBAR_WIDTH: f32 = 184.0;
@@ -683,7 +685,7 @@ fn initial_data() -> GraphData {
 }
 
 fn main() {
-    Application::new()
+    support::Application::new()
         .with_assets(ShapeAssets)
         .run(|cx: &mut App| {
             cx.open_window(

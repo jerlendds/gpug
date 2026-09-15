@@ -1,13 +1,16 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+mod support;
 use gpug::{
     Edge, Graph, GraphData, GraphRenderer, GraphStyle, Node, NodeAppearance, NodeShape, Position,
     WorldPoint, WorldSize,
 };
 use gpui::{
-    canvas, div, px, rgb, App, AppContext, Application, Context, Entity, IntoElement,
-    ParentElement, Render, Styled, Window, WindowOptions,
+    canvas, div, px, rgb, App, AppContext, Context, Entity, IntoElement, ParentElement, Render,
+    Styled, Window, WindowOptions,
 };
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use support::Instant;
 
 const NODE_COUNT: usize = 1_000;
 const COLUMNS: usize = 20;
@@ -198,7 +201,7 @@ fn stress_data() -> GraphData {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    support::Application::new().run(|cx: &mut App| {
         cx.open_window(
             WindowOptions {
                 app_id: Some("GPUG — Stress Test".into()),
@@ -221,7 +224,7 @@ fn main() {
                         .child(node.metadata["caption"].clone())
                         .into_any_element()
                 });
-                let animate = std::env::var("GPUG_ANIMATE").is_ok_and(|value| value != "0");
+                let animate = support::env_var("GPUG_ANIMATE").is_ok_and(|value| value != "0");
                 let graph = cx.new(|cx| {
                     let mut graph = Graph::builder()
                         .data(stress_data())
@@ -229,7 +232,7 @@ fn main() {
                         .handle_positions(Position::Top, Position::Bottom)
                         .show_handles(true)
                         .only_render_visible_elements(
-                            !std::env::var("GPUG_CULL").is_ok_and(|value| value == "0"),
+                            !support::env_var("GPUG_CULL").is_ok_and(|value| value == "0"),
                         )
                         .fit_on_load()
                         .build(cx)
@@ -241,11 +244,11 @@ fn main() {
                 });
                 cx.new(|_| {
                     let mut view = StressView::new(graph);
-                    let fixed = std::env::var("GPUG_ZOOM_SCALE")
+                    let fixed = support::env_var("GPUG_ZOOM_SCALE")
                         .ok()
                         .and_then(|value| value.parse().ok());
                     if fixed.is_some()
-                        || std::env::var("GPUG_ZOOM_SWEEP").is_ok_and(|value| value != "0")
+                        || support::env_var("GPUG_ZOOM_SWEEP").is_ok_and(|value| value != "0")
                     {
                         view.sweep = Some(ZoomSweep {
                             started: Instant::now(),

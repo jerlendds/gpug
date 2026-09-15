@@ -1,0 +1,8 @@
+[package]
+name = "omoika"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui.workspace = true
+gpug.workspace = true

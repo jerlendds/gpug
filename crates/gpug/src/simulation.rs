@@ -1,3 +1,4 @@
+#[cfg(not(target_family = "wasm"))]
 use rayon::prelude::*;
 
 use crate::coordinates::WorldPoint;
@@ -227,51 +228,60 @@ impl LayoutWorkspace {
         let offsets = &self.adjacency_offsets;
         let targets = &self.adjacency_targets;
         let forces_scope = profile::scope(Phase::LayoutForces);
-        self.fx
-            .par_iter_mut()
-            .zip(self.fy.par_iter_mut())
-            .enumerate()
-            .for_each(|(index, (force_x, force_y))| {
-                let x = xs[index];
-                let y = ys[index];
-                let (mut repulsion_x, mut repulsion_y) = (0.0, 0.0);
-                accumulate_repulsion(
-                    tree,
-                    body_leaf,
-                    0,
-                    index,
-                    x,
-                    y,
-                    &mut repulsion_x,
-                    &mut repulsion_y,
-                );
-                *force_x = REPULSION * repulsion_x;
-                *force_y = REPULSION * repulsion_y;
+        // Browser examples run without shared-memory workers. Keep the same
+        // force/integration math, using ordinary iterators on that target.
+        #[cfg(not(target_family = "wasm"))]
+        let forces = self.fx.par_iter_mut().zip(self.fy.par_iter_mut());
+        #[cfg(target_family = "wasm")]
+        let forces = self.fx.iter_mut().zip(self.fy.iter_mut());
+        forces.enumerate().for_each(|(index, (force_x, force_y))| {
+            let x = xs[index];
+            let y = ys[index];
+            let (mut repulsion_x, mut repulsion_y) = (0.0, 0.0);
+            accumulate_repulsion(
+                tree,
+                body_leaf,
+                0,
+                index,
+                x,
+                y,
+                &mut repulsion_x,
+                &mut repulsion_y,
+            );
+            *force_x = REPULSION * repulsion_x;
+            *force_y = REPULSION * repulsion_y;
 
-                for &neighbor in &targets[offsets[index]..offsets[index + 1]] {
-                    *force_x += ATTRACTION * (xs[neighbor] - x);
-                    *force_y += ATTRACTION * (ys[neighbor] - y);
-                }
-            });
+            for &neighbor in &targets[offsets[index]..offsets[index + 1]] {
+                *force_x += ATTRACTION * (xs[neighbor] - x);
+                *force_y += ATTRACTION * (ys[neighbor] - y);
+            }
+        });
 
         drop(forces_scope);
         let _integrate = profile::scope(Phase::LayoutIntegrate);
         // ForceAtlas2 adaptive speed: swinging detects erratic movement while
         // effective traction measures useful convergence.
-        let (total_swinging, total_traction) = (0..n)
-            .into_par_iter()
-            .map(|index| {
-                let mass = (offsets[index + 1] - offsets[index] + 1) as f32;
-                let delta_x = self.old_fx[index] - self.fx[index];
-                let delta_y = self.old_fy[index] - self.fy[index];
-                let sum_x = self.old_fx[index] + self.fx[index];
-                let sum_y = self.old_fy[index] + self.fy[index];
-                (
-                    mass * (delta_x * delta_x + delta_y * delta_y).sqrt(),
-                    mass * 0.5 * (sum_x * sum_x + sum_y * sum_y).sqrt(),
-                )
-            })
-            .reduce(|| (0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+        #[cfg(not(target_family = "wasm"))]
+        let indices = (0..n).into_par_iter();
+        #[cfg(target_family = "wasm")]
+        let indices = 0..n;
+        let contributions = indices.map(|index| {
+            let mass = (offsets[index + 1] - offsets[index] + 1) as f32;
+            let delta_x = self.old_fx[index] - self.fx[index];
+            let delta_y = self.old_fy[index] - self.fy[index];
+            let sum_x = self.old_fx[index] + self.fx[index];
+            let sum_y = self.old_fy[index] + self.fy[index];
+            (
+                mass * (delta_x * delta_x + delta_y * delta_y).sqrt(),
+                mass * 0.5 * (sum_x * sum_x + sum_y * sum_y).sqrt(),
+            )
+        });
+        #[cfg(not(target_family = "wasm"))]
+        let (total_swinging, total_traction) =
+            contributions.reduce(|| (0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+        #[cfg(target_family = "wasm")]
+        let (total_swinging, total_traction) =
+            contributions.fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
         if total_swinging > 0.0 && total_traction > 0.0 {
             let estimated_jitter = 0.05 * (n as f32).sqrt();
             let jitter = estimated_jitter
@@ -306,10 +316,17 @@ impl LayoutWorkspace {
             .first()
             .map_or((0.0, 0.0), |root| (root.mass_x, root.mass_y));
         let speed = self.speed;
-        let total_displacement = xs[..n]
+        #[cfg(not(target_family = "wasm"))]
+        let positions = xs[..n]
             .par_iter_mut()
             .zip(ys[..n].par_iter_mut())
-            .zip(self.fx.par_iter().zip(self.fy.par_iter()))
+            .zip(self.fx.par_iter().zip(self.fy.par_iter()));
+        #[cfg(target_family = "wasm")]
+        let positions = xs[..n]
+            .iter_mut()
+            .zip(ys[..n].iter_mut())
+            .zip(self.fx.iter().zip(self.fy.iter()));
+        let total_displacement = positions
             .enumerate()
             .map(|(index, ((x, y), (force_x, force_y)))| {
                 let mass = (offsets[index + 1] - offsets[index] + 1) as f32;

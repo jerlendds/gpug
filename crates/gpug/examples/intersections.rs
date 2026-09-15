@@ -1,10 +1,12 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+mod support;
 use gpug::{
     Graph, GraphData, GraphRenderer, Node, NodeAppearance, NodeId, NodeShape, SelectionMode,
     WorldPoint, WorldSize,
 };
 use gpui::{
-    canvas, div, px, rgb, App, AppContext, Application, Context, Entity, IntoElement,
-    ParentElement, Render, Styled, Window, WindowOptions,
+    canvas, div, px, rgb, App, AppContext, Context, Entity, IntoElement, ParentElement, Render,
+    Styled, Window, WindowOptions,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -146,7 +148,7 @@ impl Render for ExampleView {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    support::Application::new().run(|cx: &mut App| {
         cx.open_window(
             WindowOptions {
                 app_id: Some("GPUG — Intersections".into()),

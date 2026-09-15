@@ -1,7 +1,9 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+mod support;
 use gpug::{ContextMenuTarget, Edge, Graph, GraphData, Node, NodeId, WorldPoint, WorldSize};
 use gpui::{
-    div, point, prelude::*, px, rgb, App, AppContext, Application, Context, Entity, MouseButton,
-    MouseDownEvent, Pixels, Point, Render, Window, WindowOptions,
+    div, point, prelude::*, px, rgb, App, AppContext, Context, Entity, MouseButton, MouseDownEvent,
+    Pixels, Point, Render, Window, WindowOptions,
 };
 
 struct OpenMenu {
@@ -182,7 +184,7 @@ impl Render for ContextMenuExample {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    support::Application::new().run(|cx: &mut App| {
         cx.open_window(
             WindowOptions {
                 app_id: Some("GPUG — Context Menu".into()),

@@ -1,14 +1,13 @@
+#![cfg_attr(target_family = "wasm", no_main)]
 mod support;
 
 use std::sync::{Arc, Mutex};
 
 use gpug::{Edge, EdgeLabelContext, Graph, GraphData, GraphRenderer, Node, WorldPoint, WorldSize};
-use gpui::{
-    div, prelude::*, px, rgb, App, AppContext, Application, Entity, MouseButton, WindowOptions,
-};
+use gpui::{div, prelude::*, px, rgb, App, AppContext, Entity, MouseButton, WindowOptions};
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    support::Application::new().run(|cx: &mut App| {
         cx.open_window(
             WindowOptions {
                 app_id: Some("GPUG — Edge Toolbar".into()),

@@ -44,6 +44,18 @@ Created with Create GPUI App, to get started with GPUI visit the GPUI documentat
 
 ## Usage
 
+### Browser examples
+
+Build all visual examples as browser WASM pages:
+
+```sh
+python3 web/build.py --setup
+python3 -m http.server 8080 --directory target/web-examples
+```
+
+Open <http://localhost:8080/>. See [the browser build guide](web/README.md)
+for prerequisites, individual examples, and static hosting instructions.
+
 0. Ensure Rust is installed ~ [Rustup](https://rustup.rs/)
 
 1. To hack on gpug

@@ -90,7 +90,7 @@ impl Graph {
                 .initialize(&self.layout_positions, &self.layout_edges);
             self.layout_initialized = true;
         }
-        let started = std::time::Instant::now();
+        let started = crate::clock::Instant::now();
         let slice = self.layout_slice();
         let status = if self.layout.use_frame_budget() {
             step_with_budget(

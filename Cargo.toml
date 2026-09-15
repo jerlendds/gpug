@@ -1,9 +1,10 @@
 [workspace]
-members = ["crates/gpug"]
+members = ["crates/gpug", "crates/data"]
 default-members = ["crates/gpug"]
 resolver = "2"
 
 [workspace.dependencies]
 gpug = { path = "crates/gpug" }
+gpug-data = { path = "crates/data" }
 
 gpui = { git = "https://github.com/zed-industries/zed" }
