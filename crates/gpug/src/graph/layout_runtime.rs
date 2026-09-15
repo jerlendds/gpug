@@ -110,6 +110,16 @@ impl Graph {
         if matches!(&status, LayoutStatus::Converged) {
             apply_fit(&mut self.layout_positions, self.layout_options.fit);
         }
+        if self
+            .layout_positions
+            .iter()
+            .any(|p| !p.x.is_finite() || !p.y.is_finite())
+        {
+            self.playing = false;
+            return LayoutStatus::Failed {
+                error: "layout produced non-finite output".into(),
+            };
+        }
         if self.model.store.columns.is_flat() {
             // No hierarchy: an absolute position is the position. This is the
             // overwhelmingly common shape, and taking it as one branch for the

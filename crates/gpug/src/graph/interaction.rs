@@ -1,5 +1,47 @@
 use super::*;
 
+/// Read live measured geometry, with a safe runtime fallback for stale indices.
+fn pick_node_geometry(
+    model: &EditorModel,
+    node: &Node,
+    index: Option<usize>,
+) -> (WorldPoint, crate::WorldSize) {
+    if let Some(index) = index.filter(|&index| {
+        index < model.store.columns.len()
+            && model
+                .nodes
+                .get(index)
+                .is_some_and(|candidate| candidate.id == node.id)
+    }) {
+        let columns = &model.store.columns;
+        return (
+            columns.center(index),
+            crate::WorldSize::new(columns.width[index], columns.height[index]),
+        );
+    }
+    (
+        model.store.node_center_absolute(node),
+        model
+            .store
+            .runtimes
+            .get(&node.id)
+            .map_or(node.size, |runtime| runtime.measured),
+    )
+}
+
+fn use_columnar_picking() -> bool {
+    #[cfg(feature = "benchmark-interaction")]
+    {
+        static COLUMNS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *COLUMNS.get_or_init(|| {
+            !std::env::var("GPUG_PICK_GEOMETRY").is_ok_and(|v| v == "rows")
+                && !std::env::var("GPUG_LEGACY_HOVER").is_ok_and(|v| v == "1")
+        })
+    }
+    #[cfg(not(feature = "benchmark-interaction"))]
+    true
+}
+
 fn auto_pan_delta_for_bounds(
     viewport: &Viewport,
     top_left: ViewportPoint,
@@ -55,6 +97,43 @@ fn auto_pan_delta_for_bounds(
 }
 
 impl Graph {
+    /// Apply only the latest motion before a paint, or synchronously on release.
+    /// The existing mutation executor still validates and publishes the batch.
+    pub(super) fn apply_pending_node_drag(&mut self) -> bool {
+        let Some(world) = self.pending_node_drag.take() else {
+            return false;
+        };
+        let Some(items) = self.drag_nodes.as_ref() else {
+            return false;
+        };
+        let _edit = profile::scope(Phase::DragEdit);
+        let targets = items
+            .iter()
+            .map(|(id, offset)| (*id, WorldPoint::new(world.x - offset.x, world.y - offset.y)))
+            .collect::<Vec<_>>();
+        self.model.move_nodes(&targets, true);
+        self.layout_initialized = false;
+        true
+    }
+
+    // Comparison oracle for the former per-event hover scans. Production builds
+    // cannot enable this path. Keep it unchanged while measuring input fixes.
+    #[cfg(feature = "benchmark-interaction")]
+    pub(super) fn benchmark_legacy_hover(&mut self, position: Point<Pixels>) -> bool {
+        static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*LEGACY.get_or_init(|| std::env::var("GPUG_LEGACY_HOVER").is_ok_and(|v| v == "1")) {
+            return false;
+        }
+        self.pointer_over_handle = self.handle_at_screen_position(position, false).is_some()
+            || self.handle_at_screen_position(position, true).is_some();
+        let reconnect =
+            !self.pointer_over_handle && self.reconnect_at_screen_position(position).is_some();
+        let item = self.node_at_screen_position(position).is_some()
+            || self.edge_index_at_screen_position(position).is_some();
+        std::hint::black_box((reconnect, item));
+        true
+    }
+
     pub(super) fn node_drag_auto_pan_delta(&self) -> ViewportPoint {
         if !self.auto_pan || self.drag_nodes.is_none() {
             return ViewportPoint::new(0.0, 0.0);
@@ -82,14 +161,16 @@ impl Graph {
             Gesture::NodeDrag { node, .. } => Some(node),
             _ => None,
         };
-        for (index, offset) in self
+        for (id, offset) in self
             .drag_nodes
             .as_ref()
             .into_iter()
             .flatten()
-            .filter(|(index, _)| gesture_node == Some(self.model.nodes[*index].id))
+            .filter(|(id, _)| gesture_node == Some(*id))
         {
-            let node = &self.model.nodes[*index];
+            let Some(node) = self.model.node(*id) else {
+                continue;
+            };
             let Some(size) = self
                 .model
                 .store
@@ -167,12 +248,7 @@ impl Graph {
             .as_ref()
             .into_iter()
             .flatten()
-            .map(|(index, offset)| {
-                (
-                    self.model.nodes[*index].id,
-                    WorldPoint::new(world.x - offset.x, world.y - offset.y),
-                )
-            })
+            .map(|(id, offset)| (*id, WorldPoint::new(world.x - offset.x, world.y - offset.y)))
             .collect::<Vec<_>>();
         self.model.move_nodes(&targets, true);
         self.layout_initialized = false;
@@ -183,12 +259,13 @@ impl Graph {
         let _scope = profile::scope(Phase::Pick);
         let zoom = self.viewport.zoom().max(f32::MIN_POSITIVE);
         let hit_radius = self.renderer.style().hit_radius_pixels;
+        let default_hit_radius = hit_radius.max(self.renderer.default_node_radius_pixels(zoom));
         let world = self.screen_to_world(position);
         // The pointer's hit region in world units. Nodes without content are
         // hit within a fixed pixel radius; nodes with content are hit within
         // their own body, which can be larger, so the query is widened by the
         // radius and each candidate is then tested exactly.
-        let margin = hit_radius / zoom;
+        let margin = default_hit_radius / zoom;
         let query = WorldBounds::new(
             WorldPoint::new(world.x - margin, world.y - margin),
             crate::WorldSize::new(margin * 2.0, margin * 2.0),
@@ -218,7 +295,12 @@ impl Graph {
                     px(columns.height[index] * zoom * 0.5),
                 )
             } else {
-                (px(hit_radius), px(hit_radius))
+                let radius = if self.renderer.uses_default_node_appearance(node) {
+                    default_hit_radius
+                } else {
+                    hit_radius
+                };
+                (px(radius), px(radius))
             };
             if (center.x - position.x).abs() > half_width
                 || (center.y - position.y).abs() > half_height
@@ -287,12 +369,11 @@ impl Graph {
             .model
             .nodes
             .iter()
-            .enumerate()
-            .filter(|(_, node)| self.model.store.node_selected(node) && node.draggable)
-            .map(|(index, node)| {
+            .filter(|node| self.model.store.node_selected(node) && node.draggable)
+            .map(|node| {
                 let absolute = self.model.store.node_position_absolute(node);
                 (
-                    index,
+                    node.id,
                     WorldPoint::new(world.x - absolute.x, world.y - absolute.y),
                 )
             })
@@ -300,10 +381,7 @@ impl Graph {
         if items.is_empty() {
             return false;
         }
-        let affected = items
-            .iter()
-            .map(|(index, _)| self.model.nodes[*index].id)
-            .collect();
+        let affected = items.iter().map(|(id, _)| *id).collect();
         self.drag_nodes = Some(items);
         self.auto_pan_edge_since = None;
         self.pointer = Some(PointerController::begin(
@@ -342,27 +420,26 @@ impl Graph {
         position: Point<Pixels>,
         end: bool,
     ) -> Option<(HandleKey, WorldPoint)> {
+        let _scope = profile::scope(Phase::HandlePick);
         let handle_diameter = px(CONNECTION_HANDLE_SIZE_WORLD * self.viewport.zoom());
+        let columnar = use_columnar_picking();
         self.model
             .nodes
             .iter()
-            .filter_map(|node| {
+            .enumerate()
+            .filter_map(|(index, node)| {
                 if !node.connectable || node.hidden {
                     return None;
                 }
-                let center = self.world_to_screen(self.node_center(node));
+                let (world_center, measured) =
+                    pick_node_geometry(&self.model, node, columnar.then_some(index));
+                let center = self.world_to_screen(world_center);
                 let kind = if end {
                     HandleKind::Target
                 } else {
                     HandleKind::Source
                 };
                 if node.connectable_body {
-                    let measured = self
-                        .model
-                        .store
-                        .runtimes
-                        .get(&node.id)
-                        .map_or(node.size, |runtime| runtime.measured);
                     let half_width = px(measured.width * self.viewport.zoom() * 0.5);
                     let half_height = px(measured.height * self.viewport.zoom() * 0.5);
                     let inside = (center.x - position.x).abs() <= half_width
@@ -381,7 +458,7 @@ impl Graph {
                                 id: None,
                                 kind,
                             },
-                            self.node_center(node),
+                            world_center,
                         ));
                     }
                 }
@@ -391,11 +468,7 @@ impl Graph {
                 let handle_position = connection_handle_position(
                     center,
                     connection_geometry_size(
-                        self.model
-                            .store
-                            .runtimes
-                            .get(&node.id)
-                            .map_or(node.size, |runtime| runtime.measured),
+                        measured,
                         self.renderer.node_appearance(node, self.viewport.zoom()),
                         self.viewport.zoom(),
                     ),
@@ -421,23 +494,37 @@ impl Graph {
             .map(|(_, key, center)| (key, center))
     }
 
-    pub(super) fn is_handle_at_screen_position(&self, position: Point<Pixels>) -> bool {
-        self.handle_at_screen_position(position, false).is_some()
-            || self.handle_at_screen_position(position, true).is_some()
-    }
-
     pub(super) fn reconnect_at_screen_position(
         &self,
         position: Point<Pixels>,
     ) -> Option<(HandleKey, ConnectionIntent)> {
+        let _scope = profile::scope(Phase::ReconnectPick);
+        let indexed = use_columnar_picking()
+            && self.synced_membership_revision == self.model.store.dirty.revisions.membership
+            && self.layout_edges.len() == self.model.edges.len()
+            && self.model.store.columns.len() == self.model.nodes.len();
         self.model
             .edges
             .iter()
             .enumerate()
             .filter(|(_, edge)| edge.reconnectable)
             .find_map(|(index, edge)| {
-                let source = self.model.node(edge.source)?;
-                let target = self.model.node(edge.target)?;
+                let (source, target, source_index, target_index) = if indexed {
+                    let layout = self.layout_edges[index];
+                    (
+                        &self.model.nodes[layout.source],
+                        &self.model.nodes[layout.target],
+                        Some(layout.source),
+                        Some(layout.target),
+                    )
+                } else {
+                    (
+                        self.model.node(edge.source)?,
+                        self.model.node(edge.target)?,
+                        None,
+                        None,
+                    )
+                };
                 let straight;
                 let world_path = match self
                     .scene
@@ -447,28 +534,24 @@ impl Graph {
                 {
                     Some(path) => path,
                     None => {
+                        let (source_center, source_size) =
+                            pick_node_geometry(&self.model, source, source_index);
+                        let (target_center, target_size) =
+                            pick_node_geometry(&self.model, target, target_index);
                         straight = [
                             connection_edge_world_position(
-                                self.node_center(source),
+                                source_center,
                                 connection_geometry_size(
-                                    self.model
-                                        .store
-                                        .runtimes
-                                        .get(&source.id)
-                                        .map_or(source.size, |runtime| runtime.measured),
+                                    source_size,
                                     self.renderer.node_appearance(source, self.viewport.zoom()),
                                     self.viewport.zoom(),
                                 ),
                                 self.source_handle_position,
                             ),
                             connection_edge_world_position(
-                                self.node_center(target),
+                                target_center,
                                 connection_geometry_size(
-                                    self.model
-                                        .store
-                                        .runtimes
-                                        .get(&target.id)
-                                        .map_or(target.size, |runtime| runtime.measured),
+                                    target_size,
                                     self.renderer.node_appearance(target, self.viewport.zoom()),
                                     self.viewport.zoom(),
                                 ),
@@ -694,20 +777,50 @@ impl Graph {
                 near_segment(start, end, tolerance).then_some(edge_index)
             })
     }
-
-    fn edge_at_screen_position(&self, position: Point<Pixels>) -> bool {
-        self.edge_index_at_screen_position(position).is_some()
-    }
-
-    pub(super) fn graph_item_at_screen_position(&self, position: Point<Pixels>) -> bool {
-        self.node_at_screen_position(position).is_some() || self.edge_at_screen_position(position)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::auto_pan_delta_for_bounds;
     use crate::{Viewport, ViewportPoint, WorldSize};
+
+    #[test]
+    fn columnar_picking_matches_runtime_geometry_after_edits_and_measurement() {
+        use crate::{EditorModel, GraphOwnership, Node, NodeChange, NodeId, WorldPoint, WorldSize};
+        let nodes = vec![
+            Node::new(1u64, WorldPoint::new(12., 35.)).with_origin(WorldPoint::new(0.5, 0.5)),
+            Node::new(2u64, WorldPoint::new(3., 7.)).with_parent(1u64),
+        ];
+        let mut model = EditorModel::new(nodes, vec![], GraphOwnership::Internal).unwrap();
+        model
+            .store
+            .measure_node(NodeId(2), WorldSize::new(17., 23.), vec![]);
+        model
+            .emit_nodes([NodeChange::Position {
+                id: NodeId(2),
+                position: Some(WorldPoint::new(40., 60.)),
+                dragging: Some(true),
+            }])
+            .unwrap();
+        for (index, node) in model.nodes.iter().enumerate() {
+            let oracle = super::pick_node_geometry(&model, node, None);
+            assert_eq!(super::pick_node_geometry(&model, node, Some(index)), oracle);
+            // A mismatched or out-of-range dense index must use the ID runtime.
+            assert_eq!(
+                super::pick_node_geometry(&model, node, Some(1 - index)),
+                oracle
+            );
+            assert_eq!(super::pick_node_geometry(&model, node, Some(100)), oracle);
+        }
+        model
+            .replace_external(vec![Node::new(2u64, WorldPoint::new(-80., 90.))], vec![])
+            .unwrap();
+        let node = &model.nodes[0];
+        assert_eq!(
+            super::pick_node_geometry(&model, node, Some(0)),
+            super::pick_node_geometry(&model, node, None)
+        );
+    }
 
     #[test]
     fn dragged_node_auto_pan_stops_away_from_edges() {

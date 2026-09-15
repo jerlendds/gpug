@@ -9,6 +9,7 @@ camera changes from mutating graph geometry.
 - [Getting started and API overview](api.md)
 - [Coordinate systems](coordinates.md)
 - [Graph data and generators](data.md)
+- [Vortex model, analytics and optional persistence](data-integration.md)
 - [Incremental and batch layouts](layouts.md)
 - [Viewport, interaction, and styling](view.md)
 - [Performance architecture](performance.md)

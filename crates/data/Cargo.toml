@@ -8,29 +8,16 @@ license = "MIT"
 
 [features]
 default = []
-vortex = ["dep:vortex"]
+vortex = [] # Compatibility alias: Vortex is now required.
+benchmark-backends = []
 duckdb = ["dep:duckdb"]
 duckdb-bundled = ["duckdb", "duckdb/bundled"]
-gpug = ["dep:gpug", "dep:gpui"]
 
 [dependencies]
-vortex = { version = "=0.86.1", default-features = false, features = ["files", "tokio", "zstd"], optional = true }
+vortex = { version = "=0.86.1", default-features = false, features = ["files", "tokio", "zstd"] }
 duckdb = { version = "=1.10505.0", default-features = false, optional = true }
-gpug = { path = "../gpug", optional = true }
-gpui = { workspace = true, optional = true }
 
-[[example]]
-name = "data_flow"
-required-features = ["gpug"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
-
-[[example]]
-name = "aggregate_graph"
-required-features = ["gpug"]
-
-[[example]]
-name = "bridge_benchmark"
-required-features = ["gpug"]

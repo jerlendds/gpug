@@ -18,7 +18,7 @@ doctest = false
 [dependencies]
 gpui.workspace = true
 rayon = "1.10"
-vortex = "0.86.1"
+gpug-data = { workspace = true, default-features = false }
 
 [[example]]
 name = "kitchen_sink"
@@ -31,3 +31,16 @@ path = "examples/large_graph.rs"
 [[example]]
 name = "layout_benchmark"
 path = "examples/layout_benchmark.rs"
+
+[features]
+default = []
+duckdb = ["gpug-data/duckdb"]
+duckdb-bundled = ["duckdb", "gpug-data/duckdb-bundled"]
+vortex = [] # Compatibility alias: Vortex is always available.
+benchmark-backends = ["gpug-data/benchmark-backends"]
+# Retains the old hover path solely for controlled input profiling.
+benchmark-interaction = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tempfile = "3"

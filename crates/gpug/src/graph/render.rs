@@ -60,6 +60,9 @@ mod edge_label_tests {
 impl Render for Graph {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _frame = profile::scope(Phase::Render);
+        if self.apply_pending_node_drag() {
+            self.flush();
+        }
         let data_updates = self.data_api.take_pending();
         if !data_updates.is_empty() {
             let changes = data_updates
@@ -146,6 +149,10 @@ impl Render for Graph {
         let edge_geometries = self.scene.edge_geometries.clone();
         let selected = self.scene.selected.clone();
         let show_handles = self.show_handles;
+        // Match the size-based content LOD, independently of the content budget.
+        // Overview nodes retain their bodies and edges without editing ornaments.
+        let detail_min_pixels =
+            style.content_min_pixels_at_zoom(viewport.zoom(), viewport.max_zoom());
         let target_handle_position = self.target_handle_position;
         let source_handle_position = self.source_handle_position;
         let show_resize_handles = self.show_resize_handles;
@@ -690,6 +697,13 @@ impl Render for Graph {
                         {
                             continue;
                         }
+                        let source_detail =
+                            node_sizes[edge.source].height * viewport.zoom() >= detail_min_pixels;
+                        let target_detail =
+                            node_sizes[edge.target].height * viewport.zoom() >= detail_min_pixels;
+                        if !source_detail && !target_detail {
+                            continue;
+                        }
                         let (start_marker, end_marker) = &edge_markers[index];
                         if start_marker.is_none() && end_marker.is_none() {
                             continue;
@@ -784,10 +798,10 @@ impl Render for Graph {
                                     }
                                 }
                             };
-                        if let Some(marker) = end_marker {
+                        if let Some(marker) = end_marker.as_ref().filter(|_| target_detail) {
                             append_marker(marker, end, end_previous);
                         }
-                        if let Some(marker) = start_marker {
+                        if let Some(marker) = start_marker.as_ref().filter(|_| source_detail) {
                             append_marker(marker, start, start_next);
                         }
                     }
@@ -958,6 +972,18 @@ impl Render for Graph {
                                     ));
                                 }
                             }
+                            NodeShape::Circle => {
+                                profile::count(Counter::Quads, 1);
+                                let radius = px(appearance.radius_pixels);
+                                let diameter = radius * 2.0;
+                                window.paint_quad(
+                                    fill(
+                                        Bounds::centered_at(center, size(diameter, diameter)),
+                                        rgb(appearance.color),
+                                    )
+                                    .corner_radii(radius),
+                                );
+                            }
                             NodeShape::Square => {
                                 profile::count(Counter::Quads, 1);
                                 let diameter = px(appearance.radius_pixels * 2.0);
@@ -1022,64 +1048,51 @@ impl Render for Graph {
                         let handle_size = px(CONNECTION_HANDLE_SIZE_WORLD * viewport.zoom());
                         let outer_half = handle_size * 0.5;
                         let inner_half = (outer_half - px(1.0)).max(px(0.0));
-                        let mut handle_borders = Path::new(point(px(0.0), px(0.0)));
-                        let mut handle_fills = Path::new(point(px(0.0), px(0.0)));
-                        macro_rules! push_circle {
-                            ($path:expr, $center:expr, $radius:expr) => {{
-                                let center = $center;
-                                let radius = $radius;
-                                for segment in 0..16 {
-                                    let a = segment as f32 / 16.0 * std::f32::consts::TAU;
-                                    let b = (segment + 1) as f32 / 16.0 * std::f32::consts::TAU;
-                                    $path.push_triangle(
-                                        (
-                                            center,
-                                            point(
-                                                center.x + radius * a.cos(),
-                                                center.y + radius * a.sin(),
-                                            ),
-                                            point(
-                                                center.x + radius * b.cos(),
-                                                center.y + radius * b.sin(),
-                                            ),
+                        // Circles are analytic rounded quads in GPUI. A 16-triangle
+                        // fan per handle creates millions of upload vertices for
+                        // overview graphs, even when a handle is sub-pixel.
+                        // Retain the old ordering: all blue borders, then all
+                        // white interiors, including overlapping handles.
+                        for (color, radius) in [(0x1e90ff, outer_half), (0xffffff, inner_half)] {
+                            if radius <= px(0.0) {
+                                continue;
+                            }
+                            let diameter = radius * 2.0;
+                            for (index, position) in positions.iter().enumerate() {
+                                if hidden[index]
+                                    || node_sizes[index].height * viewport.zoom()
+                                        < detail_min_pixels
+                                    || visible_nodes
+                                        .as_ref()
+                                        .is_some_and(|visible| !visible[index])
+                                {
+                                    continue;
+                                }
+                                let center = viewport.world_to_screen(*position);
+                                for kind in [HandleKind::Target, HandleKind::Source] {
+                                    let handle = connection_handle_position(
+                                        center,
+                                        connection_geometry_size(
+                                            node_sizes[index],
+                                            node_appearances[index],
+                                            viewport.zoom(),
                                         ),
-                                        st,
-                                    );
-                                }
-                            }};
-                        }
-                        for (index, position) in positions.iter().enumerate() {
-                            if hidden[index] {
-                                continue;
-                            }
-                            if visible_nodes
-                                .as_ref()
-                                .is_some_and(|visible| !visible[index])
-                            {
-                                continue;
-                            }
-                            let center = viewport.world_to_screen(*position);
-                            for kind in [HandleKind::Target, HandleKind::Source] {
-                                let handle = connection_handle_position(
-                                    center,
-                                    connection_geometry_size(
-                                        node_sizes[index],
-                                        node_appearances[index],
+                                        kind,
+                                        target_handle_position,
+                                        source_handle_position,
                                         viewport.zoom(),
-                                    ),
-                                    kind,
-                                    target_handle_position,
-                                    source_handle_position,
-                                    viewport.zoom(),
-                                );
-                                push_circle!(handle_borders, handle, outer_half);
-                                if inner_half > px(0.0) {
-                                    push_circle!(handle_fills, handle, inner_half);
+                                    );
+                                    window.paint_quad(
+                                        fill(
+                                            Bounds::centered_at(handle, size(diameter, diameter)),
+                                            rgb(color),
+                                        )
+                                        .corner_radii(radius),
+                                    );
+                                    profile::count(Counter::Quads, 1);
                                 }
                             }
                         }
-                        window.paint_path(handle_borders, rgb(0x1e90ff));
-                        window.paint_path(handle_fills, rgb(0xffffff));
                     }
 
                     for &index in selected.iter() {
@@ -1121,7 +1134,9 @@ impl Render for Graph {
                         ] {
                             window.paint_quad(fill(strip, rgb(style.selection_color)));
                         }
-                        if !show_handles {
+                        if !show_handles
+                            && node_sizes[index].height * viewport.zoom() >= detail_min_pixels
+                        {
                             let handle_size = px(CONNECTION_HANDLE_SIZE_WORLD * viewport.zoom());
                             for kind in [HandleKind::Target, HandleKind::Source] {
                                 let handle = connection_handle_position(
@@ -1371,12 +1386,8 @@ impl Render for Graph {
 
         let canvas_cursor = if self.pan_drag_position.is_some() || self.drag_nodes.is_some() {
             CursorStyle::ClosedHand
-        } else if self.pointer_over_reconnect {
-            CursorStyle::PointingHand
         } else if self.pointer_over_handle {
             CursorStyle::Crosshair
-        } else if self.pointer_over_graph_item {
-            CursorStyle::Arrow
         } else {
             CursorStyle::OpenHand
         };
@@ -1469,6 +1480,7 @@ impl Render for Graph {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|graph, event: &MouseDownEvent, window, cx| {
+                    let _scope = profile::scope(Phase::PointerDown);
                     #[cfg(not(target_family = "wasm"))]
                     graph.focus.focus(window);
                     #[cfg(target_family = "wasm")]
@@ -1612,9 +1624,18 @@ impl Render for Graph {
                 graph.flush();
             }))
             .on_mouse_move(cx.listener(|graph, event: &MouseMoveEvent, _, cx| {
+                let _scope = profile::scope(Phase::Pointer);
+                #[cfg(feature = "benchmark-interaction")]
+                if !event.dragging() && graph.benchmark_legacy_hover(event.position) {
+                    graph.flush();
+                    cx.notify();
+                    return;
+                }
+                if !event.dragging() {
+                    return;
+                }
                 if let Some((index, control)) = graph.resize_node {
                     graph.pointer_over_handle = false;
-                    graph.pointer_over_reconnect = false;
                     let pointer = graph.screen_to_world(event.position);
                     if let Some(resized) = control.update(pointer) {
                         let id = graph.model.nodes[index].id;
@@ -1633,14 +1654,12 @@ impl Render for Graph {
                         .handle_at_screen_position(event.position, target_is_end)
                         .map(|(key, center)| graph.connection_handle(key, center));
                     graph.pointer_over_handle = target.is_some();
-                    graph.pointer_over_reconnect = false;
                     graph
                         .connection
                         .update(pointer, target.as_ref(), std::iter::empty());
                     graph.model.store.dirty.mark_connection();
-                } else if let Some(items) = graph.drag_nodes.clone() {
+                } else if graph.drag_nodes.is_some() {
                     graph.pointer_over_handle = false;
-                    graph.pointer_over_reconnect = false;
                     if let Some(pointer) = &mut graph.pointer {
                         if !pointer.update(ViewportPoint::new(
                             event.position.x / px(1.0),
@@ -1651,21 +1670,13 @@ impl Render for Graph {
                             return;
                         }
                     }
-                    let world = graph.screen_to_world(event.position);
-                    let targets = items
-                        .into_iter()
-                        .map(|(index, offset)| {
-                            (
-                                graph.model.nodes[index].id,
-                                WorldPoint::new(world.x - offset.x, world.y - offset.y),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    graph.model.move_nodes(&targets, true);
-                    graph.layout_initialized = false;
+                    // Retain the newest pointer position; hundreds of mouse
+                    // events must not run whole-graph transactions before paint.
+                    graph.pending_node_drag = Some(graph.screen_to_world(event.position));
+                    cx.notify();
+                    return;
                 } else if let Some(start) = graph.selection_start {
                     graph.pointer_over_handle = false;
-                    graph.pointer_over_reconnect = false;
                     graph.selection_current = Some(event.position);
                     let a = graph.screen_to_world(start);
                     let b = graph.screen_to_world(event.position);
@@ -1692,15 +1703,11 @@ impl Render for Graph {
                         event.position.y - previous.y,
                     ));
                     graph.pan_drag_position = Some(event.position);
-                    graph.pointer_over_graph_item = false;
                     graph.pointer_over_handle = false;
-                    graph.pointer_over_reconnect = false;
                 } else {
-                    graph.pointer_over_handle = graph.is_handle_at_screen_position(event.position);
-                    graph.pointer_over_reconnect = !graph.pointer_over_handle
-                        && graph.reconnect_at_screen_position(event.position).is_some();
-                    graph.pointer_over_graph_item =
-                        graph.graph_item_at_screen_position(event.position);
+                    // A motion event without a captured gesture does no picking,
+                    // event publication, or redraw. Mouse-down owns hit testing.
+                    return;
                 }
                 graph.flush();
                 cx.notify();
@@ -1708,6 +1715,9 @@ impl Render for Graph {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|graph, event: &MouseUpEvent, _, cx| {
+                    // Release can arrive before the queued motion was painted.
+                    // Commit it before the final dragging=false change.
+                    graph.apply_pending_node_drag();
                     let owner = graph.gestures.owner();
                     if let Some((index, mut control)) = graph.resize_node.take() {
                         let node = graph.model.nodes[index].clone();
@@ -1775,9 +1785,9 @@ impl Render for Graph {
                     if let Some(items) = graph.drag_nodes.take() {
                         let targets = items
                             .iter()
-                            .map(|(index, _)| {
-                                let node = &graph.model.nodes[*index];
-                                (node.id, graph.model.store.node_position_absolute(node))
+                            .filter_map(|(id, _)| {
+                                let node = graph.model.node(*id)?;
+                                Some((node.id, graph.model.store.node_position_absolute(node)))
                             })
                             .collect::<Vec<_>>();
                         graph.model.move_nodes(&targets, false);
@@ -1800,11 +1810,7 @@ impl Render for Graph {
                             .events
                             .push(GraphEvent::ViewportChanged(graph.viewport));
                     }
-                    graph.pointer_over_graph_item =
-                        graph.graph_item_at_screen_position(event.position);
-                    graph.pointer_over_handle = graph.is_handle_at_screen_position(event.position);
-                    graph.pointer_over_reconnect = !graph.pointer_over_handle
-                        && graph.reconnect_at_screen_position(event.position).is_some();
+                    graph.pointer_over_handle = false;
                     graph.flush();
                     cx.notify();
                 }),

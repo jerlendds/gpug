@@ -128,18 +128,18 @@ pub const NO_PARENT: u32 = u32::MAX;
 #[derive(Clone, Debug, Default)]
 pub struct NodeColumns {
     /// Absolute top-left corner in world units.
-    pub x: Vec<f32>,
-    pub y: Vec<f32>,
+    pub x: gpug_data::column::Column<f32>,
+    pub y: gpug_data::column::Column<f32>,
     /// Measured size in world units.
-    pub width: Vec<f32>,
-    pub height: Vec<f32>,
+    pub width: gpug_data::column::Column<f32>,
+    pub height: gpug_data::column::Column<f32>,
     /// Which point inside the node its position refers to, in 0..1.
-    pub origin_x: Vec<f32>,
-    pub origin_y: Vec<f32>,
+    pub origin_x: gpug_data::column::Column<f32>,
+    pub origin_y: gpug_data::column::Column<f32>,
     /// Parent node index, or [`NO_PARENT`]. An index removes the hash lookup
     /// a layout frame would otherwise pay per node to resolve hierarchy.
-    pub parent: Vec<u32>,
-    pub hidden: Vec<bool>,
+    pub parent: gpug_data::column::Column<u32>,
+    pub hidden: gpug_data::column::Column<bool>,
     /// Advances on every write, so a consumer that caches something derived
     /// from the columns can tell whether it is still current.
     revision: u64,
@@ -1060,6 +1060,10 @@ impl EditorStore {
 /// mutating host data; internal ownership applies the same changes immediately.
 #[derive(Default)]
 pub struct EditorModel {
+    // Only Graph can opt in: its model is private and all structural writes are
+    // validated. Public EditorModel fields may be edited directly, so standalone
+    // models retain complete projected-graph validation on every transaction.
+    private_snapshot: bool,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub store: EditorStore,
@@ -1082,6 +1086,7 @@ impl EditorModel {
         };
         store.rebuild(&nodes, &edges);
         Ok(Self {
+            private_snapshot: false,
             nodes,
             edges,
             store,
@@ -1090,6 +1095,147 @@ impl EditorModel {
             node_middleware: Vec::new(),
             edge_middleware: Vec::new(),
         })
+    }
+
+    pub(crate) fn with_private_snapshot(mut self) -> Self {
+        self.private_snapshot = true;
+        self
+    }
+
+    fn apply_scalar_changes(
+        &mut self,
+        nodes: &[NodeChange],
+        edges: &[EdgeChange],
+    ) -> Option<Result<(), GraphDataError>> {
+        if !self.private_snapshot
+            || nodes.iter().any(|change| {
+                !matches!(
+                    change,
+                    NodeChange::Position { .. }
+                        | NodeChange::Dimensions { .. }
+                        | NodeChange::Select { .. }
+                )
+            })
+            || edges
+                .iter()
+                .any(|change| !matches!(change, EdgeChange::Select { .. }))
+        {
+            return None;
+        }
+        Some(self.commit_scalar_changes(nodes, edges))
+    }
+
+    fn commit_scalar_changes(
+        &mut self,
+        changes: &[NodeChange],
+        edge_changes: &[EdgeChange],
+    ) -> Result<(), GraphDataError> {
+        // Stage only the fields the batch can change. Validate final projected
+        // values (including repeated targets) before any runtime or event write.
+        let mut projected = HashMap::with_capacity(changes.len());
+        for change in changes {
+            let id = match change {
+                NodeChange::Position { id, .. }
+                | NodeChange::Dimensions { id, .. }
+                | NodeChange::Select { id, .. } => *id,
+                _ => unreachable!("structural changes use the full transaction"),
+            };
+            let index = *self
+                .store
+                .node_lookup
+                .get(&id)
+                .ok_or(GraphDataError::UnknownNode(id))?;
+            let node = &self.nodes[index];
+            let fields =
+                projected
+                    .entry(id)
+                    .or_insert((index, node.position, node.size, node.selected));
+            match change {
+                NodeChange::Position {
+                    position: Some(value),
+                    ..
+                } => fields.1 = *value,
+                NodeChange::Dimensions {
+                    size: Some(value), ..
+                } => fields.2 = *value,
+                NodeChange::Select { selected, .. } => fields.3 = *selected,
+                _ => {}
+            }
+        }
+        for change in edge_changes {
+            let EdgeChange::Select { id, .. } = change else {
+                unreachable!()
+            };
+            if !self.store.edge_lookup.contains_key(id) {
+                return Err(GraphDataError::UnknownEdge(*id));
+            }
+        }
+        if let Some((&id, _)) = projected
+            .iter()
+            .filter(|(_, (_, position, size, _))| {
+                !position.x.is_finite()
+                    || !position.y.is_finite()
+                    || !size.width.is_finite()
+                    || !size.height.is_finite()
+            })
+            .min_by_key(|(_, (index, ..))| *index)
+        {
+            return Err(GraphDataError::NonFiniteNodeGeometry(id));
+        }
+        self.store.apply_selection_stacking(changes);
+        if self.store.ownership == GraphOwnership::External {
+            self.store.apply_selection_overlay(changes, edge_changes);
+        } else {
+            for (_, (index, position, size, selected)) in projected {
+                let node = &mut self.nodes[index];
+                node.position = position;
+                node.size = size;
+                node.selected = selected;
+            }
+            for change in edge_changes {
+                let EdgeChange::Select { id, selected } = change else {
+                    unreachable!()
+                };
+                self.edges[self.store.edge_lookup[id]].selected = *selected;
+            }
+            self.sync_scalar_runtimes(changes);
+        }
+        if changes
+            .iter()
+            .any(|c| matches!(c, NodeChange::Select { .. }))
+            || !edge_changes.is_empty()
+        {
+            self.store.dirty.mark_selection();
+        }
+        Ok(())
+    }
+
+    fn sync_scalar_runtimes(&mut self, changes: &[NodeChange]) {
+        for change in changes {
+            match change {
+                NodeChange::Position { id, dragging, .. } => {
+                    if let Some(index) = self.store.node_lookup.get(id).copied() {
+                        self.store
+                            .update_node_from_spec(&self.nodes[index], dragging.unwrap_or(false));
+                    }
+                }
+                NodeChange::Dimensions { id, .. } => {
+                    self.store.dirty.mark_node_spec();
+                    if let Some(index) = self.store.node_lookup.get(id).copied() {
+                        let node = &self.nodes[index];
+                        let handles = self
+                            .store
+                            .runtimes
+                            .get(id)
+                            .map(|r| r.handles.clone())
+                            .unwrap_or_default();
+                        self.store.measure_node(*id, node.size, handles);
+                        self.store.update_node_from_spec(node, false);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     pub fn replace_external(
@@ -1112,6 +1258,11 @@ impl EditorModel {
         let mut changes: Vec<_> = changes.into_iter().collect();
         for middleware in &self.node_middleware {
             middleware(&mut changes);
+        }
+        if let Some(result) = self.apply_scalar_changes(&changes, &[]) {
+            result?;
+            self.node_changes.extend(changes);
+            return Ok(());
         }
         let mut projected = self.nodes.clone();
         apply_node_changes(&mut projected, &self.edges, &changes)?;
@@ -1175,6 +1326,11 @@ impl EditorModel {
         for middleware in &self.edge_middleware {
             middleware(&mut changes);
         }
+        if let Some(result) = self.apply_scalar_changes(&[], &changes) {
+            result?;
+            self.edge_changes.extend(changes);
+            return Ok(());
+        }
         let mut projected = self.edges.clone();
         apply_edge_changes(&self.nodes, &mut projected, &changes)?;
         if self.store.ownership == GraphOwnership::External {
@@ -1215,6 +1371,35 @@ impl EditorModel {
         }
         for middleware in &self.edge_middleware {
             middleware(&mut edge_changes);
+        }
+        // Selection cannot alter geometry or topology. Avoid rebuilding both
+        // for a click, while retaining atomic middleware and event semantics.
+        if node_changes
+            .iter()
+            .all(|c| matches!(c, NodeChange::Select { .. }))
+        {
+            if let Some(result) = self.apply_scalar_changes(&node_changes, &edge_changes) {
+                result?;
+                if self.store.ownership == GraphOwnership::Internal {
+                    // Selection-sensitive node renderers may change endpoint geometry.
+                    if !node_changes.is_empty() {
+                        self.store.dirty.mark_node_spec();
+                    }
+                    // Custom paths may inspect selection as part of their edge.
+                    for change in &edge_changes {
+                        let EdgeChange::Select { id, .. } = change else {
+                            unreachable!()
+                        };
+                        let revision = self.store.edge_revisions.entry(*id).or_default();
+                        *revision = revision.wrapping_add(1);
+                        self.store.dirty.mark_edge(*id);
+                        self.store.dirty.mark_edge_spec();
+                    }
+                }
+                self.node_changes.extend(node_changes);
+                self.edge_changes.extend(edge_changes);
+                return Ok(());
+            }
         }
         validate_node_change_targets(&self.nodes, &node_changes)?;
         validate_edge_change_targets(&self.edges, &edge_changes)?;
@@ -1804,6 +1989,168 @@ impl RendererRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_scalar_transactions_match_full_validation() {
+        for ownership in [GraphOwnership::Internal, GraphOwnership::External] {
+            let mut parent = Node::new(1u64, WorldPoint::new(10., 20.));
+            parent.selected = true;
+            let mut child = Node::new(2u64, WorldPoint::new(3., 4.));
+            child.parent_id = Some(parent.id);
+            let nodes = vec![parent, child];
+            let edges = vec![Edge::new_with_id(1u64, 2u64, 10u64)];
+            let mut oracle = EditorModel::new(nodes.clone(), edges.clone(), ownership).unwrap();
+            let mut fast = EditorModel::new(nodes, edges, ownership)
+                .unwrap()
+                .with_private_snapshot();
+            let batches = vec![
+                vec![NodeChange::Position {
+                    id: NodeId(1),
+                    position: Some(WorldPoint::new(50., 60.)),
+                    dragging: Some(true),
+                }],
+                vec![NodeChange::Dimensions {
+                    id: NodeId(2),
+                    size: Some(WorldSize::new(70., 80.)),
+                    resizing: Some(true),
+                }],
+                vec![
+                    NodeChange::Position {
+                        id: NodeId(2),
+                        position: Some(WorldPoint::new(f32::NAN, 0.)),
+                        dragging: Some(true),
+                    },
+                    NodeChange::Position {
+                        id: NodeId(2),
+                        position: Some(WorldPoint::new(7., 8.)),
+                        dragging: Some(false),
+                    },
+                ],
+                vec![NodeChange::Select {
+                    id: NodeId(1),
+                    selected: false,
+                }],
+                vec![NodeChange::Position {
+                    id: NodeId(1),
+                    position: Some(WorldPoint::new(f32::NAN, 0.)),
+                    dragging: None,
+                }],
+                vec![NodeChange::Select {
+                    id: NodeId(999),
+                    selected: true,
+                }],
+                vec![NodeChange::Replace {
+                    id: NodeId(2),
+                    item: Node::new(2u64, WorldPoint::new(9., 10.)),
+                }],
+            ];
+            for batch in batches {
+                assert_eq!(fast.emit_nodes(batch.clone()), oracle.emit_nodes(batch));
+                assert_eq!(fast.nodes, oracle.nodes);
+                assert_eq!(fast.edges, oracle.edges);
+                // Debug comparison retains NaN payload events, for which float PartialEq is false.
+                assert_eq!(
+                    format!("{:?}", fast.take_changes()),
+                    format!("{:?}", oracle.take_changes())
+                );
+                for node in &oracle.nodes {
+                    let a = &fast.store.runtimes[&node.id];
+                    let b = &oracle.store.runtimes[&node.id];
+                    assert_eq!(
+                        (a.position_absolute, a.measured, a.dragging, a.resizing, a.z),
+                        (b.position_absolute, b.measured, b.dragging, b.resizing, b.z)
+                    );
+                    assert_eq!(
+                        fast.store.node_selected(node),
+                        oracle.store.node_selected(node)
+                    );
+                }
+            }
+            let batch = vec![EdgeChange::Select {
+                id: EdgeId(10),
+                selected: true,
+            }];
+            assert_eq!(fast.emit_edges(batch.clone()), oracle.emit_edges(batch));
+            assert_eq!(fast.edges, oracle.edges);
+            assert_eq!(fast.take_changes(), oracle.take_changes());
+        }
+    }
+
+    #[test]
+    fn private_atomic_selection_preserves_geometry_and_matches_events() {
+        for ownership in [GraphOwnership::Internal, GraphOwnership::External] {
+            let nodes = vec![
+                Node::new(1u64, WorldPoint::ZERO),
+                Node::new(2u64, WorldPoint::new(10., 20.)),
+            ];
+            let edges = vec![Edge::new_with_id(1u64, 2u64, 3u64)];
+            let mut slow = EditorModel::new(nodes.clone(), edges.clone(), ownership).unwrap();
+            let mut fast = EditorModel::new(nodes, edges, ownership)
+                .unwrap()
+                .with_private_snapshot();
+            for selected in [true, false, true] {
+                let nodes = [NodeChange::Select {
+                    id: NodeId(1),
+                    selected,
+                }];
+                let edges = [EdgeChange::Select {
+                    id: EdgeId(3),
+                    selected,
+                }];
+                assert_eq!(
+                    fast.emit_graph_changes(nodes.clone(), edges.clone()),
+                    slow.emit_graph_changes(nodes, edges)
+                );
+                assert_eq!(fast.nodes, slow.nodes);
+                assert_eq!(fast.edges, slow.edges);
+                assert_eq!(fast.take_changes(), slow.take_changes());
+                assert_eq!(
+                    fast.store.node_selected(&fast.nodes[0]),
+                    slow.store.node_selected(&slow.nodes[0])
+                );
+                assert_eq!(
+                    fast.store.edge_selected(&fast.edges[0]),
+                    slow.store.edge_selected(&slow.edges[0])
+                );
+            }
+            let before = fast.nodes.clone();
+            assert!(fast
+                .emit_graph_changes(
+                    [NodeChange::Select {
+                        id: NodeId(1),
+                        selected: false
+                    }],
+                    [EdgeChange::Select {
+                        id: EdgeId(999),
+                        selected: true
+                    }]
+                )
+                .is_err());
+            assert_eq!(fast.nodes, before);
+            assert_eq!(fast.take_changes(), (vec![], vec![]));
+        }
+    }
+
+    #[test]
+    fn private_empty_batch_runs_middleware_and_public_snapshots_still_validate() {
+        let node = Node::new(1u64, WorldPoint::new(0., 0.));
+        let mut public =
+            EditorModel::new(vec![node.clone()], vec![], GraphOwnership::Internal).unwrap();
+        public.nodes[0].position.x = f32::NAN;
+        assert!(public.emit_nodes([]).is_err());
+        let mut private = EditorModel::new(vec![node], vec![], GraphOwnership::Internal)
+            .unwrap()
+            .with_private_snapshot();
+        private.add_node_middleware(|changes| {
+            changes.push(NodeChange::Select {
+                id: NodeId(1),
+                selected: true,
+            })
+        });
+        private.emit_graph_changes([], []).unwrap();
+        assert!(private.nodes[0].selected);
+        assert_eq!(private.take_changes().0.len(), 1);
+    }
 
     /// The dense columns are what every per-frame scan reads, so they have to
     /// agree with the runtime map they mirror. A layout frame writes them

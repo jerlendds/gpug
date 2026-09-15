@@ -1,6 +1,7 @@
 //! Live worker-prepared aggregate graph. Wheel zoom, pan, select, then drill down.
+use gpug::analysis::{spatial::*, worker::*, *};
+use gpug::gpug_bridge::*;
 use gpug::{Graph, GraphEvent, GraphRenderer, GraphStyle, NodeAppearance, NodeShape, Viewport};
-use gpug_data::{gpug_bridge::*, spatial::*, worker::*, *};
 use gpui::{
     canvas, div, point, prelude::*, px, rgb, App, AppContext, Application, Context, Entity,
     MouseButton, Render, Subscription, Window, WindowOptions,

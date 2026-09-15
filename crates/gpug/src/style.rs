@@ -4,6 +4,9 @@ pub struct GraphStyle {
     pub node_color: u32,
     pub edge_color: u32,
     pub selection_color: u32,
+    /// Preferred radius of the default circular canvas node in world units.
+    /// Its screen radius is at least one pixel and three times the connection
+    /// handle radius at the same zoom. Custom node renderers control their shape.
     pub node_radius_world: f32,
     /// Default rendered edge width in screen pixels.
     ///
@@ -13,7 +16,9 @@ pub struct GraphStyle {
     pub hit_radius_pixels: f32,
     pub interactive_edge_budget: usize,
     /// Smallest on-screen node height, in pixels, that still renders the
-    /// node's registered element content.
+    /// node's registered element content. Connection handles and edge markers
+    /// at that node also hide below this threshold, independently of the content
+    /// budget; active connection feedback remains visible.
     ///
     /// Below this the node keeps its position, size, and colors but is drawn
     /// from the scene columns as one batched quad. Element trees cost layout

@@ -53,10 +53,16 @@ pub enum Phase {
     SceneAppearance,
     /// Scene columns derived from selection and stacking.
     SceneSelection,
+    /// Entire pointer motion callback (includes nested picking/edit scopes).
+    Pointer,
+    HandlePick,
+    ReconnectPick,
+    DragEdit,
+    PointerDown,
 }
 
 impl Phase {
-    pub const COUNT: usize = 18;
+    pub const COUNT: usize = 23;
     const NAMES: [&'static str; Self::COUNT] = [
         "sync",
         "layout",
@@ -76,11 +82,20 @@ impl Phase {
         " .motion",
         " .appear",
         " .select",
+        "pointer",
+        "handles",
+        "reconnect",
+        "drag",
+        "down",
     ];
     #[inline]
     fn index(self) -> usize {
         self as usize
     }
+}
+
+thread_local! {
+    static POINTER_SAMPLES: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -183,6 +198,28 @@ impl Drop for Scope {
             return;
         };
         let elapsed = start.elapsed().as_nanos() as u64;
+        #[cfg(feature = "benchmark-interaction")]
+        if self.phase == Phase::PointerDown {
+            eprintln!("pick_down_ms,{:.6}", elapsed as f64 / 1e6);
+        }
+        if self.phase == Phase::Pointer {
+            POINTER_SAMPLES.with(|samples| {
+                let mut samples = samples.borrow_mut();
+                samples.push(elapsed);
+                // A saturated input queue may prevent the frame reporter from
+                // running. Still report latency during a complete paint stall.
+                if samples.len() == 512 {
+                    samples.sort_unstable();
+                    eprintln!(
+                        "pointer_batch_ms p50={:.3} p95={:.3} p99={:.3} samples=512",
+                        samples[256] as f64 / 1e6,
+                        samples[485] as f64 / 1e6,
+                        samples[506] as f64 / 1e6
+                    );
+                    samples.clear();
+                }
+            });
+        }
         NANOS[self.phase.index()].fetch_add(elapsed, Ordering::Relaxed);
         COUNTS[self.phase.index()].fetch_add(1, Ordering::Relaxed);
     }
@@ -238,6 +275,22 @@ pub fn frame(nodes: usize, edges: usize, visible: usize, contents: usize) {
             total / interval()
         ));
     }
+    POINTER_SAMPLES.with(|samples| {
+        let mut samples = samples.borrow_mut();
+        if !samples.is_empty() {
+            samples.sort_unstable();
+            let at =
+                |q: f64| samples[((samples.len() - 1) as f64 * q).round() as usize] as f64 / 1e6;
+            line.push_str(&format!(
+                "\n  pointer_ms p50={:.3} p95={:.3} p99={:.3} samples={}",
+                at(0.5),
+                at(0.95),
+                at(0.99),
+                samples.len()
+            ));
+            samples.clear();
+        }
+    });
     REPORTED.store(true, Ordering::Relaxed);
     eprintln!("{line}");
 }
@@ -256,4 +309,15 @@ mod tests {
         }
         assert_eq!(NANOS[Phase::Paint.index()].load(Ordering::Relaxed), before);
     }
+}
+
+/// Retained scene-access baseline for same-binary benchmark comparisons only.
+pub(crate) fn reference_scene() -> bool {
+    #[cfg(feature = "benchmark-interaction")]
+    {
+        static REFERENCE: OnceLock<bool> = OnceLock::new();
+        *REFERENCE.get_or_init(|| std::env::var("GPUG_REFERENCE_SCENE").is_ok_and(|v| v == "1"))
+    }
+    #[cfg(not(feature = "benchmark-interaction"))]
+    false
 }

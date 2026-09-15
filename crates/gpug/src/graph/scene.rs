@@ -224,7 +224,7 @@ impl Graph {
             edge_specs: revisions.edge_specs,
             selection: revisions.selection,
             style: self.style_revision,
-            zoom_bits: zoom.to_bits(),
+            zoom_bits: renderer.node_appearance_zoom_key(zoom),
         };
         if self.scene.appearance != Some(appearance) {
             let _scope = profile::scope(Phase::SceneAppearance);
@@ -235,6 +235,20 @@ impl Graph {
                 .iter()
                 .map(|node| renderer.node_appearance(node, zoom))
                 .collect();
+        }
+        // Edge appearance receives no zoom parameter. Camera motion must not
+        // call every edge renderer or rebuild the edge appearance array.
+        let edge_appearance = AppearanceRevision {
+            zoom_bits: if profile::reference_scene() {
+                zoom.to_bits()
+            } else {
+                0
+            },
+            ..appearance
+        };
+        if self.scene.edge_appearance != Some(edge_appearance) {
+            let _scope = profile::scope(Phase::SceneAppearance);
+            self.scene.edge_appearance = Some(edge_appearance);
             self.scene.edge_appearances = self
                 .model
                 .edges
@@ -394,17 +408,30 @@ pub(super) fn connection_handle_position(
 }
 
 pub(super) fn world_bounds(nodes: &[Node], store: &EditorStore) -> Option<WorldBounds> {
-    let mut visible = nodes.iter().filter(|node| !node.hidden);
-    let first = visible.next()?;
-    let first = store.runtimes.get(&first.id)?.bounds();
+    // Graph owns the validated snapshot; structural edits synchronously rebuild
+    // these columns. Fit/follow needs only measured bounds, not rich runtime data.
+    let columns = &store.columns;
+    let mut visible = nodes.iter().enumerate().filter(|(_, node)| !node.hidden);
+    let reference = profile::reference_scene();
+    let bounds_at = |index: usize| {
+        if reference {
+            return store.runtimes[&nodes[index].id].bounds();
+        }
+        WorldBounds::new(
+            WorldPoint::new(columns.x[index], columns.y[index]),
+            columns.size(index),
+        )
+    };
+    let (first, _) = visible.next()?;
+    let first = bounds_at(first);
     let (mut min_x, mut max_x, mut min_y, mut max_y) = (
         first.origin.x,
         first.origin.x + first.size.width,
         first.origin.y,
         first.origin.y + first.size.height,
     );
-    for node in visible {
-        let bounds = store.runtimes.get(&node.id)?.bounds();
+    for (index, _) in visible {
+        let bounds = bounds_at(index);
         min_x = min_x.min(bounds.origin.x);
         max_x = max_x.max(bounds.origin.x + bounds.size.width);
         min_y = min_y.min(bounds.origin.y);
@@ -457,4 +484,60 @@ pub(super) fn selected_node_bounds(
         WorldPoint::new(min_x, min_y),
         crate::WorldSize::new(max_x - min_x, max_y - min_y),
     ))
+}
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::world_bounds;
+    use crate::{EditorModel, GraphOwnership, Node, NodeChange, NodeId, WorldBounds, WorldPoint};
+
+    #[test]
+    fn column_bounds_match_measured_runtime_union_after_edits() {
+        let mut child = Node::new(2u64, WorldPoint::new(-7., 9.));
+        child.parent_id = Some(NodeId(1));
+        let mut hidden = Node::new(3u64, WorldPoint::new(10000., 10000.));
+        hidden.hidden = true;
+        let mut model = EditorModel::new(
+            vec![Node::new(1u64, WorldPoint::new(10., 20.)), child, hidden],
+            vec![],
+            GraphOwnership::Internal,
+        )
+        .unwrap();
+        model
+            .store
+            .measure_node(NodeId(2), crate::WorldSize::new(200., 300.), vec![]);
+        model
+            .emit_nodes([NodeChange::Position {
+                id: NodeId(1),
+                position: Some(WorldPoint::new(-50., 60.)),
+                dragging: Some(true),
+            }])
+            .unwrap();
+        let actual = world_bounds(&model.nodes, &model.store).unwrap();
+        let mut expected = model
+            .nodes
+            .iter()
+            .filter(|n| !n.hidden)
+            .map(|n| model.store.runtimes[&n.id].bounds());
+        let first = expected.next().unwrap();
+        let (mut min_x, mut min_y) = (first.origin.x, first.origin.y);
+        let (mut max_x, mut max_y) = (min_x + first.size.width, min_y + first.size.height);
+        for b in expected {
+            min_x = min_x.min(b.origin.x);
+            min_y = min_y.min(b.origin.y);
+            max_x = max_x.max(b.origin.x + b.size.width);
+            max_y = max_y.max(b.origin.y + b.size.height);
+        }
+        assert_eq!(
+            actual,
+            WorldBounds::new(
+                WorldPoint::new(min_x, min_y),
+                crate::WorldSize::new(max_x - min_x, max_y - min_y)
+            )
+        );
+        for node in &mut model.nodes {
+            node.hidden = true;
+        }
+        assert_eq!(world_bounds(&model.nodes, &model.store), None);
+    }
 }

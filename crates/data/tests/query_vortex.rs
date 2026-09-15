@@ -1,4 +1,3 @@
-#![cfg(feature = "vortex")]
 use gpug_data::query::*;
 use gpug_data::vortex_io::*;
 use gpug_data::*;

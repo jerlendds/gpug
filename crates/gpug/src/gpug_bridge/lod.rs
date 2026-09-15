@@ -1,5 +1,5 @@
 use super::{to_view_node, BridgeError, WEIGHT_KEY};
-use crate::{
+use gpug_data::{
     spatial::{LodKind, PlanConnections, PlanEndpoint},
     Node,
 };
@@ -14,20 +14,20 @@ pub const INTERNAL_EDGES_KEY: &str = "gpug-data.internal_edges";
 /// Keep this object with the installed view and replace it atomically with data.
 #[derive(Debug)]
 pub struct LodGraphData {
-    pub data: gpug::GraphData,
+    pub data: crate::GraphData,
     connections: PlanConnections,
-    node_items: HashMap<gpug::NodeId, usize>,
-    edge_groups: HashMap<gpug::EdgeId, usize>,
+    node_items: HashMap<crate::NodeId, usize>,
+    edge_groups: HashMap<crate::EdgeId, usize>,
     context_groups: Vec<usize>,
 }
 impl LodGraphData {
     pub fn connections(&self) -> &PlanConnections {
         &self.connections
     }
-    pub fn node_item(&self, id: gpug::NodeId) -> Option<usize> {
+    pub fn node_item(&self, id: crate::NodeId) -> Option<usize> {
         self.node_items.get(&id).copied()
     }
-    pub fn edge_group(&self, id: gpug::EdgeId) -> Option<usize> {
+    pub fn edge_group(&self, id: crate::EdgeId) -> Option<usize> {
         self.edge_groups.get(&id).copied()
     }
     /// Groups represented as context rather than connecting two distinct items:
@@ -95,9 +95,9 @@ pub fn to_lod_graph_data(
             (PlanEndpoint::Item(source), PlanEndpoint::Item(target)) if source != target => {
                 let scene_id = u64::try_from(group_index).expect("group count fits u64");
                 let mut edge =
-                    gpug::Edge::new_with_id(nodes[source].id, nodes[target].id, scene_id);
+                    crate::Edge::new_with_id(nodes[source].id, nodes[target].id, scene_id);
                 edge.label = Some(format!("{} edges", group.edge_count));
-                edge.marker_end = Some(gpug::EdgeMarker::ArrowClosed);
+                edge.marker_end = Some(crate::EdgeMarker::ArrowClosed);
                 edge.reconnectable = false;
                 edge.deletable = false;
                 edge.metadata
@@ -116,7 +116,7 @@ pub fn to_lod_graph_data(
     }
     // Every source edge belongs either to one rendered group, an explicit context
     // group, or hidden incidence. Context never acquires a fabricated geometry.
-    let data = gpug::GraphData::new(nodes, edges);
+    let data = crate::GraphData::new(nodes, edges);
     data.compile_edges()?;
     Ok(LodGraphData {
         data,

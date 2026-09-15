@@ -1007,8 +1007,6 @@ dependencies = [
 [[package]]
 name = "blade-util"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a6be3a82c001ba7a17b6f8e413ede5d1004e6047213f8efaf0ffc15b5c4904c"
 dependencies = [
  "blade-graphics",
  "bytemuck",
@@ -2739,9 +2737,11 @@ dependencies = [
 name = "gpug"
 version = "0.1.0"
 dependencies = [
+ "gpug-data",
  "gpui",
  "rayon",
- "vortex",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -2749,8 +2749,6 @@ name = "gpug-data"
 version = "0.1.0"
 dependencies = [
  "duckdb",
- "gpug",
- "gpui",
  "tempfile",
  "tokio",
  "vortex",
@@ -7368,7 +7366,6 @@ dependencies = [
  "vortex-metrics",
  "vortex-session",
  "vortex-utils",
- "wasm-bindgen-futures",
 ]
 
 [[package]]
@@ -7434,7 +7431,6 @@ dependencies = [
  "tokio",
  "tracing",
  "twox-hash",
- "uuid",
  "vortex-array",
  "vortex-arrow",
  "vortex-btrblocks",

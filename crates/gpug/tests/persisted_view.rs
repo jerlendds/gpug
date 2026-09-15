@@ -1,7 +1,6 @@
-#![cfg(all(feature = "vortex", feature = "duckdb", feature = "gpug"))]
-use gpug_data::{
-    duckdb_store::*, gpug_bridge::*, query::*, spatial::*, vortex_io::*, worker::*, *,
-};
+#![cfg(feature = "duckdb")]
+use gpug::analysis::{duckdb_store::*, query::*, spatial::*, vortex_io::*, worker::*, *};
+use gpug::gpug_bridge::*;
 use std::{
     collections::HashSet,
     sync::{mpsc, Arc},

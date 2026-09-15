@@ -57,3 +57,8 @@ nodes, retaining local clustering while reducing long graph distances.
 
 Graph generation is deliberately separate from `Graph`; generator-specific
 parameters never appear in the view constructor.
+
+## Analytical model and persistence
+
+See [data integration](data-integration.md) for the canonical Vortex model,
+`GraphSnapshot`, indexed analysis, worker capture and optional DuckDB saves.

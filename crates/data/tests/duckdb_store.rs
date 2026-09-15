@@ -228,7 +228,6 @@ fn independent_connections_reject_stale_writers_and_invalid_saved_data() {
     ));
 }
 
-#[cfg(feature = "vortex")]
 #[tokio::test]
 async fn native_vortex_exports_and_imports_preserve_committed_generations() {
     use gpug_data::vortex_io::*;

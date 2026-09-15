@@ -1,5 +1,8 @@
+use crate::column::FrozenColumn;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::OnceLock;
+use vortex::array::ArrayRef;
 
 /// Stable caller-assigned identity; never a dense array index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -14,6 +17,7 @@ impl From<u64> for NodeId {
         Self(value)
     }
 }
+
 impl From<u64> for EdgeId {
     fn from(value: u64) -> Self {
         Self(value)
@@ -146,8 +150,8 @@ pub enum Mutation {
 
 #[derive(Debug)]
 pub(crate) struct Adjacency {
-    offsets: Vec<usize>,
-    edges: Vec<u32>,
+    offsets: FrozenColumn<usize>,
+    edges: FrozenColumn<u32>,
 }
 
 impl Adjacency {
@@ -166,7 +170,10 @@ impl Adjacency {
             edges[*cursor] = edge as u32;
             *cursor += 1;
         }
-        Self { offsets, edges }
+        Self {
+            offsets: offsets.into(),
+            edges: edges.into(),
+        }
     }
 
     pub(crate) fn incident(&self, node: usize) -> &[u32] {
@@ -181,11 +188,15 @@ impl Adjacency {
 /// randomized ID hashing. Hidden nodes remain available to analytical operations.
 #[derive(Debug)]
 pub struct GraphSnapshot {
-    nodes: Vec<Node>,
-    edges: Vec<Edge>,
+    // Vortex tables are canonical. Rows are a lazily materialized compatibility
+    // view for existing slice APIs, never a second mutable source of truth.
+    tables: OnceLock<(ArrayRef, ArrayRef)>,
+    rows: OnceLock<(Vec<Node>, Vec<Edge>)>,
+    node_ids: FrozenColumn<u64>,
+    edge_ids: FrozenColumn<u64>,
     by_id: HashMap<NodeId, u32>,
-    pub(crate) sources: Vec<u32>,
-    pub(crate) targets: Vec<u32>,
+    pub(crate) sources: FrozenColumn<u32>,
+    pub(crate) targets: FrozenColumn<u32>,
     pub(crate) outgoing: Adjacency,
     pub(crate) incoming: Adjacency,
 }
@@ -237,23 +248,95 @@ impl GraphSnapshot {
         }
         let outgoing = Adjacency::build(nodes.len(), &sources);
         let incoming = Adjacency::build(nodes.len(), &targets);
+        let tables = OnceLock::new();
+        let rows = OnceLock::new();
+        let (node_ids, edge_ids);
+        if crate::column::uses_vec_backend() {
+            // Explicit benchmark baseline: preserve the former row backing.
+            node_ids = nodes
+                .iter()
+                .map(|node| node.id.0)
+                .collect::<Vec<_>>()
+                .into();
+            edge_ids = edges
+                .iter()
+                .map(|edge| edge.id.0)
+                .collect::<Vec<_>>()
+                .into();
+            let _ = rows.set((nodes, edges));
+        } else {
+            let arrays = crate::vortex_io::arrays_from_rows(&nodes, &edges)
+                .expect("validated rows produce equal-length fixed-schema Vortex columns");
+            let (node_buffer, edge_buffer) =
+                crate::vortex_io::identity_buffers(arrays.0.clone(), arrays.1.clone())
+                    .expect("internally built Vortex identity columns have u64 buffers");
+            node_ids = node_buffer.into();
+            edge_ids = edge_buffer.into();
+            let _ = tables.set(arrays);
+        }
         Ok(Self {
-            nodes,
-            edges,
+            tables,
+            rows,
+            node_ids,
+            edge_ids,
             by_id,
-            sources,
-            targets,
+            sources: sources.into(),
+            targets: targets.into(),
             outgoing,
             incoming,
         })
     }
 
+    /// Row compatibility view. First row access materializes both relations in
+    /// O(V + E) and retains them; use `node_count`, `endpoint_columns` or
+    /// `vortex_tables` when a row representation is unnecessary.
     pub fn nodes(&self) -> &[Node] {
-        &self.nodes
+        &self.rows().0
     }
+    /// Row compatibility view with the same one-time materialization as `nodes`.
     pub fn edges(&self) -> &[Edge] {
-        &self.edges
+        &self.rows().1
     }
+
+    /// Number of source nodes, without materializing the row compatibility view.
+    pub fn node_count(&self) -> usize {
+        self.node_ids.len()
+    }
+    /// Number of source edges, without materializing the row compatibility view.
+    pub fn edge_count(&self) -> usize {
+        self.edge_ids.len()
+    }
+    pub(crate) fn node_id(&self, index: usize) -> NodeId {
+        NodeId(self.node_ids[index])
+    }
+    pub(crate) fn edge_id(&self, index: usize) -> EdgeId {
+        EdgeId(self.edge_ids[index])
+    }
+    /// Canonical Vortex relations. Cloning an array shares its buffers. This is
+    /// O(1) for the production backend; it materializes columns once only for the
+    /// explicitly enabled benchmark row backend.
+    pub fn vortex_tables(&self) -> &(ArrayRef, ArrayRef) {
+        self.tables.get_or_init(|| {
+            let (nodes, edges) = self
+                .rows
+                .get()
+                .expect("snapshot has canonical tables or baseline rows");
+            crate::vortex_io::arrays_from_rows(nodes, edges)
+                .expect("validated snapshot rows have fixed Vortex schemas")
+        })
+    }
+
+    fn rows(&self) -> &(Vec<Node>, Vec<Edge>) {
+        self.rows.get_or_init(|| {
+            let (nodes, edges) = self
+                .tables
+                .get()
+                .expect("production snapshot owns Vortex tables");
+            crate::vortex_io::VortexGraphIo::rows_from_arrays(nodes.clone(), edges.clone())
+                .expect("internally built canonical tables have validated schemas and values")
+        })
+    }
+
     pub fn node_index(&self, id: NodeId) -> Option<u32> {
         self.by_id.get(&id).copied()
     }
@@ -272,8 +355,8 @@ impl GraphSnapshot {
         &self,
         changes: impl IntoIterator<Item = Mutation>,
     ) -> Result<Self, GraphError> {
-        let mut nodes = self.nodes.clone();
-        let mut edges = self.edges.clone();
+        let mut nodes = self.nodes().to_vec();
+        let mut edges = self.edges().to_vec();
         for change in changes {
             match change {
                 Mutation::AddNode(node) => {
@@ -324,19 +407,19 @@ impl GraphSnapshot {
 
     /// Exact induced subgraph in original input order. Unknown IDs are errors.
     pub fn induced_subgraph(&self, ids: &[NodeId]) -> Result<Self, GraphError> {
-        let mut selected = vec![false; self.nodes.len()];
+        let mut selected = vec![false; self.nodes().len()];
         for &id in ids {
             selected[self.node_index(id).ok_or(GraphError::UnknownNode(id))? as usize] = true;
         }
         let nodes = self
-            .nodes
+            .nodes()
             .iter()
             .enumerate()
             .filter(|(i, _)| selected[*i])
             .map(|(_, n)| n.clone())
             .collect();
         let edges = self
-            .edges
+            .edges()
             .iter()
             .enumerate()
             .filter(|(i, _)| {
@@ -345,5 +428,42 @@ impl GraphSnapshot {
             .map(|(_, e)| e.clone())
             .collect();
         Self::new(nodes, edges)
+    }
+}
+
+#[cfg(test)]
+mod backing_tests {
+    use super::*;
+    use crate::{Direction, SearchBudget, SearchWorkspace};
+
+    #[test]
+    fn canonical_export_shares_arrays_and_traversal_does_not_materialize_rows() {
+        let graph = GraphSnapshot::new(
+            vec![
+                Node::new(1, WorldRect::default()),
+                Node::new(2, WorldRect::default()),
+            ],
+            vec![Edge::new(10, 1, 2)],
+        )
+        .unwrap();
+        let mut search = SearchWorkspace::new();
+        let found = search
+            .neighborhood(
+                &graph,
+                NodeId(1),
+                Direction::Outgoing,
+                SearchBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(found.nodes, &[NodeId(1), NodeId(2)]);
+        if !crate::column::uses_vec_backend() {
+            assert!(graph.rows.get().is_none());
+            assert!(graph.tables.get().is_some());
+        }
+        let exported = crate::vortex_io::graph_arrays(&graph).unwrap();
+        assert!(ArrayRef::ptr_eq(&exported.0, &graph.vortex_tables().0));
+        assert!(ArrayRef::ptr_eq(&exported.1, &graph.vortex_tables().1));
+        assert_eq!(graph.nodes()[1].id, NodeId(2));
+        assert_eq!(graph.edges()[0].id, EdgeId(10));
     }
 }

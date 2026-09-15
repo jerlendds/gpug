@@ -1,4 +1,3 @@
-#![cfg(feature = "vortex")]
 use vortex::array::arrays::struct_::StructArrayExt;
 
 use gpug_data::vortex_io::*;

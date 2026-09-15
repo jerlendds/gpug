@@ -2,9 +2,14 @@
 members = ["crates/gpug", "crates/data"]
 default-members = ["crates/gpug"]
 resolver = "2"
+exclude = ["vendor/blade-util"]
 
 [workspace.dependencies]
 gpug = { path = "crates/gpug" }
-gpug-data = { path = "crates/data" }
+gpug-data = { path = "crates/data", default-features = false }
 
 gpui = { git = "https://github.com/zed-industries/zed" }
+
+[patch.crates-io]
+# Bound GPUI's retained upload buffers during continuously growing graph views.
+blade-util = { path = "vendor/blade-util" }

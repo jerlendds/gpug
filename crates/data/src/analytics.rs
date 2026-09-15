@@ -94,7 +94,7 @@ impl SearchWorkspace {
                 truncated: true,
             });
         }
-        self.marks.resize(graph.nodes().len(), 0);
+        self.marks.resize(graph.node_count(), 0);
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
             self.marks.fill(0);
@@ -150,7 +150,7 @@ impl SearchWorkspace {
                     }
                     self.marks[next as usize] = self.epoch;
                     self.queue.push(next);
-                    self.ids.push(graph.nodes()[next as usize].id);
+                    self.ids.push(graph.node_id(next as usize));
                     self.depths.push(depth + 1);
                 }
             }
@@ -180,7 +180,7 @@ impl GraphSnapshot {
     /// Components are numbered by first node encountered in input order.
     /// This whole-graph analytical operation belongs on a worker thread.
     pub fn weak_components(&self) -> Vec<u32> {
-        let mut labels = vec![u32::MAX; self.nodes().len()];
+        let mut labels = vec![u32::MAX; self.node_count()];
         let mut queue = Vec::new();
         let mut component = 0;
         for seed in 0..labels.len() {

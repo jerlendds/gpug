@@ -38,6 +38,9 @@ impl EdgePaintContext<'_> {
     }
 }
 
+/// Diameter in world units, shared by handle painting and the default node proxy.
+pub(crate) const CONNECTION_HANDLE_SIZE_WORLD: f32 = 0.7;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NodeShape {
     /// No canvas primitive. Used when registered node content paints the shell
@@ -45,6 +48,8 @@ pub enum NodeShape {
     /// cheap representation to fall back to when the node is small on screen.
     None,
     Square,
+    /// A circular canvas proxy, sized by `NodeAppearance::radius_pixels`.
+    Circle,
     Diamond,
     /// The node body as a rounded rectangle spanning its world size.
     ///
@@ -395,6 +400,16 @@ impl GraphRenderer {
         };
         appearance
     }
+    /// Built-in appearance depends on zoom only through its clamped radius.
+    /// Custom callbacks can depend on the exact zoom and retain that dependency.
+    pub(crate) fn node_appearance_zoom_key(&self, zoom: f32) -> u32 {
+        if self.node_types.is_empty() && !crate::profile::reference_scene() {
+            self.default_node_radius_pixels(zoom).to_bits()
+        } else {
+            zoom.to_bits()
+        }
+    }
+
     pub fn node_appearance(&self, node: &Node, zoom: f32) -> NodeAppearance {
         if !matches!(
             node.node_type.as_str(),
@@ -413,8 +428,8 @@ impl GraphRenderer {
             .map_or(
                 NodeAppearance {
                     color: self.style.node_color,
-                    radius_pixels: self.node_radius_pixels(zoom),
-                    shape: NodeShape::Square,
+                    radius_pixels: self.default_node_radius_pixels(zoom),
+                    shape: NodeShape::Circle,
                 },
                 |renderer| renderer.appearance(node, zoom, &self.style),
             );
@@ -461,6 +476,22 @@ impl GraphRenderer {
             1
         }
     }
+    pub(crate) fn uses_default_node_appearance(&self, node: &Node) -> bool {
+        !self.node_types.contains_key(&node.node_type) && !self.node_types.contains_key("default")
+    }
+
+    pub(crate) fn default_node_radius_pixels(&self, zoom: f32) -> f32 {
+        // Compare diameters at the same zoom, even while overview LOD hides
+        // handles. Keep the existing one-pixel radius floor for legibility.
+        let handle_radius = if zoom.is_finite() {
+            zoom.max(0.0) * (CONNECTION_HANDLE_SIZE_WORLD * 0.5)
+        } else {
+            0.0
+        };
+        self.node_radius_pixels(zoom)
+            .max((handle_radius * 3.0).min(f32::MAX * 0.5))
+    }
+
     pub fn node_radius_pixels(&self, zoom: f32) -> f32 {
         let radius = self.style.node_radius_world * zoom;
         if radius.is_finite() {
@@ -477,6 +508,61 @@ mod tests {
     use crate::WorldPoint;
     use gpui::{div, IntoElement};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[test]
+    fn default_circle_is_at_least_three_handle_diameters() {
+        let node = Node::new(1u64, WorldPoint::ZERO);
+        for radius_world in [0.0, 0.1, 2.0] {
+            let mut renderer = GraphRenderer::default();
+            renderer.set_style(GraphStyle {
+                node_radius_world: radius_world,
+                ..GraphStyle::default()
+            });
+            for zoom in [0.0001, 0.1, 0.5, 1.0, 4.0, 16.0, 32.0] {
+                let appearance = renderer.node_appearance(&node, zoom);
+                assert_eq!(appearance.shape, NodeShape::Circle);
+                assert!(
+                    appearance.radius_pixels * 2.0 >= CONNECTION_HANDLE_SIZE_WORLD * zoom * 3.0
+                );
+                assert!(appearance.radius_pixels >= 1.0);
+            }
+            for zoom in [f32::NAN, f32::INFINITY, f32::MAX] {
+                assert!((renderer.node_appearance(&node, zoom).radius_pixels * 2.0).is_finite());
+            }
+        }
+    }
+
+    #[test]
+    fn appearance_zoom_cache_preserves_builtin_and_custom_output() {
+        let mut renderer = GraphRenderer::default();
+        let node = Node::new(1u64, WorldPoint::ZERO);
+        let mut previous = None;
+        for zoom in [0.0001, 0.0002, 0.01, 0.1, 1., 2., 10., 20.] {
+            let key = renderer.node_appearance_zoom_key(zoom);
+            let appearance = renderer.node_appearance(&node, zoom);
+            if let Some((old_key, old_appearance)) = previous {
+                if key == old_key {
+                    assert_eq!(appearance, old_appearance);
+                }
+            }
+            previous = Some((key, appearance));
+        }
+        renderer.register_node_type("default", |_: &Node, zoom: f32, _: &GraphStyle| {
+            NodeAppearance {
+                color: zoom.to_bits(),
+                radius_pixels: 1.,
+                shape: NodeShape::Square,
+            }
+        });
+        assert_ne!(
+            renderer.node_appearance_zoom_key(0.0001),
+            renderer.node_appearance_zoom_key(0.0002)
+        );
+        assert_ne!(
+            renderer.node_appearance(&node, 0.0001),
+            renderer.node_appearance(&node, 0.0002)
+        );
+    }
+
     #[test]
     fn unknown_type_falls_back_to_default_registry() {
         let mut renderer = GraphRenderer::default();

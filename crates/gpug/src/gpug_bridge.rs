@@ -1,4 +1,4 @@
-//! Optional conversion between analytical snapshots and GPUG editor/view data.
+//! Conversion between analytical snapshots and GPUG editor/view data.
 //!
 //! Conversion allocates and validates whole snapshots: run it on a data worker,
 //! then publish through `Graph::set_data` or the external-ownership API. Renderer
@@ -8,7 +8,7 @@ use std::fmt;
 mod lod;
 pub use lod::{to_lod_graph_data, LodGraphData, AGGREGATE_COUNT_KEY, INTERNAL_EDGES_KEY};
 
-use crate::{Edge, EdgeId, GraphError, GraphSnapshot, Node, NodeId, WorldRect};
+use gpug_data::{Edge, EdgeId, GraphError, GraphSnapshot, Node, NodeId, WorldRect};
 
 /// Metadata key used for the analytical node label in GPUG nodes.
 pub const LABEL_KEY: &str = "label";
@@ -18,7 +18,7 @@ pub const WEIGHT_KEY: &str = "gpug-data.weight";
 #[derive(Debug)]
 pub enum BridgeError {
     Data(GraphError),
-    View(gpug::GraphDataError),
+    View(crate::GraphDataError),
     MissingRuntime(NodeId),
     UnrepresentableGeometry(NodeId),
     InvalidStoredWeight(EdgeId),
@@ -52,8 +52,8 @@ impl From<GraphError> for BridgeError {
         Self::Data(error)
     }
 }
-impl From<gpug::GraphDataError> for BridgeError {
-    fn from(error: gpug::GraphDataError) -> Self {
+impl From<crate::GraphDataError> for BridgeError {
+    fn from(error: crate::GraphDataError) -> Self {
         Self::View(error)
     }
 }
@@ -66,7 +66,7 @@ impl From<gpug::GraphDataError> for BridgeError {
 /// regions and other presentation state are host-owned and are not in this data
 /// schema. Configure these on the returned data before validation/publication;
 /// register custom content by the preserved `node_type` in the host renderer.
-pub fn to_graph_data(snapshot: &GraphSnapshot) -> Result<gpug::GraphData, BridgeError> {
+pub fn to_graph_data(snapshot: &GraphSnapshot) -> Result<crate::GraphData, BridgeError> {
     let mut nodes = Vec::with_capacity(snapshot.nodes().len());
     for source in snapshot.nodes() {
         let node = to_view_node(source)?;
@@ -76,7 +76,7 @@ pub fn to_graph_data(snapshot: &GraphSnapshot) -> Result<gpug::GraphData, Bridge
         .edges()
         .iter()
         .map(|source| {
-            let mut edge = gpug::Edge::new_with_id(source.source.0, source.target.0, source.id.0);
+            let mut edge = crate::Edge::new_with_id(source.source.0, source.target.0, source.id.0);
             edge.source_handle.clone_from(&source.source_handle);
             edge.target_handle.clone_from(&source.target_handle);
             edge.metadata
@@ -84,12 +84,12 @@ pub fn to_graph_data(snapshot: &GraphSnapshot) -> Result<gpug::GraphData, Bridge
             edge
         })
         .collect();
-    let data = gpug::GraphData::new(nodes, edges);
+    let data = crate::GraphData::new(nodes, edges);
     data.compile_edges()?;
     Ok(data)
 }
 
-fn to_view_node(source: &Node) -> Result<gpug::Node, BridgeError> {
+fn to_view_node(source: &Node) -> Result<crate::Node, BridgeError> {
     let bounds = source.bounds;
     // Snapshot validation guarantees finite f64 inputs. Narrowing can still
     // overflow, including the right/bottom endpoint after f32 rounding.
@@ -100,9 +100,9 @@ fn to_view_node(source: &Node) -> Result<gpug::Node, BridgeError> {
     {
         return Err(BridgeError::UnrepresentableGeometry(source.id));
     }
-    let mut node = gpug::Node::new(source.id.0, gpug::WorldPoint::new(x, y))
-        .with_origin(gpug::WorldPoint::new(0., 0.))
-        .with_size(gpug::WorldSize::new(width, height))
+    let mut node = crate::Node::new(source.id.0, crate::WorldPoint::new(x, y))
+        .with_origin(crate::WorldPoint::new(0., 0.))
+        .with_size(crate::WorldSize::new(width, height))
         .with_type(source.renderer.clone());
     node.hidden = source.hidden;
     node.metadata.insert(LABEL_KEY.into(), source.label.clone());
@@ -118,8 +118,31 @@ fn to_view_node(source: &Node) -> Result<gpug::Node, BridgeError> {
 /// revision. Missing runtime geometry and malformed reserved weight metadata are
 /// errors. Edges without weight metadata have weight 1. Presentation-only fields
 /// and arbitrary metadata are not persisted by this schema.
-pub fn from_editor(editor: &gpug::EditorModel) -> Result<GraphSnapshot, BridgeError> {
-    gpug::data::compile_edges(&editor.nodes, &editor.edges)?;
+pub fn from_editor(editor: &crate::EditorModel) -> Result<GraphSnapshot, BridgeError> {
+    capture_editor(editor)?.into_snapshot()
+}
+
+/// Owned analytical rows captured from one coherent editor state. Move this to
+/// a worker to validate and build the snapshot's dense topology and CSR indexes.
+/// Capture copies O(V + E) data; it is explicit and never runs during painting.
+#[derive(Debug)]
+pub struct SnapshotCapture {
+    nodes: Vec<Node>,
+    edges: Vec<Edge>,
+}
+
+impl SnapshotCapture {
+    /// Validate captured rows and build immutable analytical indexes on a worker.
+    pub fn into_snapshot(self) -> Result<GraphSnapshot, BridgeError> {
+        Ok(GraphSnapshot::new(self.nodes, self.edges)?)
+    }
+}
+
+/// Copy measured absolute geometry and analytical fields on the editor's owner
+/// thread. Use `SnapshotCapture::into_snapshot` on a worker for index construction.
+/// Has the same schema and capture errors as `from_editor`.
+pub fn capture_editor(editor: &crate::EditorModel) -> Result<SnapshotCapture, BridgeError> {
+    crate::data::compile_edges(&editor.nodes, &editor.edges)?;
     let nodes = editor
         .nodes
         .iter()
@@ -161,5 +184,46 @@ pub fn from_editor(editor: &gpug::EditorModel) -> Result<GraphSnapshot, BridgeEr
             Ok(edge)
         })
         .collect::<Result<Vec<_>, BridgeError>>()?;
-    Ok(GraphSnapshot::new(nodes, edges)?)
+    Ok(SnapshotCapture { nodes, edges })
+}
+
+impl TryFrom<&GraphSnapshot> for crate::GraphData {
+    type Error = BridgeError;
+
+    fn try_from(snapshot: &GraphSnapshot) -> Result<Self, Self::Error> {
+        to_graph_data(snapshot)
+    }
+}
+
+impl crate::EditorModel {
+    /// Construct an editor from a flat analytical snapshot. Presentation fields
+    /// outside the analytical schema use GPUG defaults. No database is required.
+    pub fn from_snapshot(
+        snapshot: &GraphSnapshot,
+        ownership: crate::GraphOwnership,
+    ) -> Result<Self, BridgeError> {
+        let data = to_graph_data(snapshot)?;
+        Ok(Self::new(data.nodes, data.edges, ownership)?)
+    }
+
+    /// Capture this editor for worker-side snapshot construction. Pending external
+    /// changes are not committed and therefore are not included in the capture.
+    pub fn capture_snapshot(&self) -> Result<SnapshotCapture, BridgeError> {
+        capture_editor(self)
+    }
+
+    /// Export measured world geometry for analysis or an explicit durable save.
+    /// This builds whole-graph indexes synchronously; use `capture_snapshot` and
+    /// move its result to a worker for large interactive editors.
+    pub fn snapshot(&self) -> Result<GraphSnapshot, BridgeError> {
+        from_editor(self)
+    }
+
+    /// Install a host-supplied analytical snapshot atomically, retaining ownership
+    /// mode and middleware. This replaces presentation state with bridge defaults,
+    /// just like `replace_external`, and does not emit user-edit change batches.
+    pub fn replace_snapshot(&mut self, snapshot: &GraphSnapshot) -> Result<(), BridgeError> {
+        let data = to_graph_data(snapshot)?;
+        Ok(self.replace_external(data.nodes, data.edges)?)
+    }
 }

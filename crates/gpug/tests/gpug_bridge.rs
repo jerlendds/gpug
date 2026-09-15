@@ -1,5 +1,5 @@
-#![cfg(feature = "gpug")]
-use gpug_data::{gpug_bridge::*, *};
+use gpug::analysis::*;
+use gpug::gpug_bridge::*;
 
 fn editor(data: gpug::GraphData) -> gpug::EditorModel {
     gpug::EditorModel::new(data.nodes, data.edges, gpug::GraphOwnership::Internal).unwrap()

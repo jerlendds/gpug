@@ -1,5 +1,5 @@
-#![cfg(feature = "gpug")]
-use gpug_data::{gpug_bridge::*, spatial::*, *};
+use gpug::analysis::{spatial::*, *};
+use gpug::gpug_bridge::*;
 use std::{collections::HashSet, sync::Arc};
 
 #[test]

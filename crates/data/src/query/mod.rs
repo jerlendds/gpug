@@ -1,10 +1,9 @@
 //! GPUG query language: typed predicates, endpoint joins, and bounded traversal.
 //! See `QUERY_LANGUAGE.md` for grammar, ordering, null, and budget semantics.
-#![doc = include_str!("../../QUERY_LANGUAGE.md")]
+#![doc = include_str!("../../docs/QUERY_LANGUAGE.md")]
 #[cfg(feature = "duckdb")]
 mod duckdb;
 mod parser;
-#[cfg(feature = "vortex")]
 mod vortex;
 
 use crate::{

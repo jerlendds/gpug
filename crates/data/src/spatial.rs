@@ -17,7 +17,7 @@ pub use lod::{
 
 const LEAF_SIZE: usize = 16;
 
-#[cfg(all(test, feature = "gpug"))]
+#[cfg(test)]
 mod aggregate_identity_tests {
     use super::*;
     use crate::Node;
@@ -118,7 +118,7 @@ pub struct SpatialIndex {
     indices: Vec<u32>,
     // Dense source index -> membership order, enabling bounded focus extraction.
     member_positions: Vec<u32>,
-    #[cfg(feature = "gpug")]
+
     aggregate_id_base: u64,
     branches: Vec<Branch>,
 }
@@ -127,9 +127,9 @@ impl SpatialIndex {
         // N source IDs occupy at most N disjoint blocks of N identities. One of
         // the first N+1 blocks must be empty. N <= u32::MAX, so every candidate
         // block fits u64. Reserve N IDs once, rather than searching on each view.
-        #[cfg(feature = "gpug")]
+
         let count = graph.nodes().len();
-        #[cfg(feature = "gpug")]
+
         let aggregate_id_base = if count == 0 {
             0
         } else {
@@ -167,7 +167,7 @@ impl SpatialIndex {
             graph,
             indices,
             member_positions,
-            #[cfg(feature = "gpug")]
+
             aggregate_id_base,
             branches,
         }
@@ -175,8 +175,13 @@ impl SpatialIndex {
     pub fn snapshot(&self) -> &Arc<GraphSnapshot> {
         &self.graph
     }
-    #[cfg(feature = "gpug")]
-    pub(crate) fn aggregate_id(&self, ordinal: usize) -> NodeId {
+
+    /// A snapshot-local scene identity disjoint from every source node ID.
+    /// These identities are ephemeral and must not be persisted as source IDs.
+    ///
+    /// # Panics
+    /// Panics if `ordinal` is at least the source node count.
+    pub fn aggregate_id(&self, ordinal: usize) -> NodeId {
         // Disjoint nonempty plan membership permits at most N aggregates.
         assert!(ordinal < self.graph.nodes().len());
         NodeId(self.aggregate_id_base + ordinal as u64)

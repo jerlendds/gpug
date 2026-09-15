@@ -74,6 +74,12 @@ for prerequisites, individual examples, and static hosting instructions.
    ```
 
 
+## Data, analysis and persistence
+
+GPUG includes a canonical Vortex data model, indexed graph queries and worker
+coordination through `gpug::analysis`. DuckDB persistence is opt-in.
+See [the integration guide](docs/data-integration.md).
+
 ## Roadmap
 
 | Feature | Description | Completed |

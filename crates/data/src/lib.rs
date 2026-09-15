@@ -6,19 +6,16 @@
 #![forbid(unsafe_code)]
 
 mod analytics;
+pub mod column;
 mod model;
 mod path;
 pub mod query;
 pub mod spatial;
 pub mod worker;
 
-#[cfg(feature = "gpug")]
-pub mod gpug_bridge;
-
 #[cfg(feature = "duckdb")]
 pub mod duckdb_store;
 
-#[cfg(feature = "vortex")]
 pub mod vortex_io;
 
 pub use analytics::{Direction, Neighborhood, SearchBudget, SearchWorkspace};

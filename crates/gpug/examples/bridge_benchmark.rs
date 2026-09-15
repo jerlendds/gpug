@@ -1,5 +1,6 @@
 //! Former aggregate-ID scan alone versus complete current one-aggregate conversion.
-use gpug_data::{gpug_bridge::to_lod_graph_data, spatial::*, *};
+use gpug::analysis::{spatial::*, *};
+use gpug::gpug_bridge::*;
 use std::{hint::black_box, sync::Arc, time::Instant};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("nodes,old_id_scan_p95_ns,current_bridge_p95_ns");

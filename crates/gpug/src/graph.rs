@@ -22,7 +22,7 @@ use crate::layout::{
 use crate::node::{Node, NodeId};
 use crate::profile::{self, Counter, Phase};
 use crate::renderer::GraphRenderer;
-use crate::renderer::{EdgeAppearance, NodeAppearance, NodeShape};
+use crate::renderer::{EdgeAppearance, NodeAppearance, NodeShape, CONNECTION_HANDLE_SIZE_WORLD};
 use crate::style::GraphStyle;
 
 #[derive(Clone, Copy)]
@@ -215,7 +215,6 @@ impl Render for NodeContentLayer {
     }
 }
 
-const CONNECTION_HANDLE_SIZE_WORLD: f32 = 0.7;
 const CONNECTION_HANDLE_GAP_WORLD: f32 = 0.5;
 const RECONNECT_HANDLE_SIZE_WORLD: f32 = 0.9;
 /// Length of the invisible target extending inward along each end of a selected edge.
@@ -291,13 +290,17 @@ fn connection_geometry_size(
     zoom: f32,
 ) -> crate::WorldSize {
     match appearance.shape {
-        NodeShape::Square | NodeShape::Diamond if zoom.is_finite() && zoom > 0.0 => {
+        NodeShape::Square | NodeShape::Circle | NodeShape::Diamond
+            if zoom.is_finite() && zoom > 0.0 =>
+        {
             let diameter_world = appearance.radius_pixels.max(0.0) * 2.0 / zoom;
             crate::WorldSize::new(diameter_world, diameter_world)
         }
-        NodeShape::None | NodeShape::Rect { .. } | NodeShape::Square | NodeShape::Diamond => {
-            node_size
-        }
+        NodeShape::None
+        | NodeShape::Rect { .. }
+        | NodeShape::Square
+        | NodeShape::Circle
+        | NodeShape::Diamond => node_size,
     }
 }
 
@@ -348,6 +351,7 @@ struct SceneCache {
     specs: Option<(u64, u64, u64)>,
     motion: Option<(u64, u64, u64, u32)>,
     appearance: Option<AppearanceRevision>,
+    edge_appearance: Option<AppearanceRevision>,
     selection: Option<(u64, u64)>,
     hidden: Rc<[bool]>,
     node_ids: Rc<[NodeId]>,
@@ -628,6 +632,12 @@ impl GraphBuilder {
         self
     }
 
+    /// Configure a flat analytical snapshot without opening a database. Conversion
+    /// validates f64-to-f32 geometry and may fail before the builder is changed.
+    pub fn snapshot(self, snapshot: &crate::GraphSnapshot) -> Result<Self, crate::BridgeError> {
+        Ok(self.data(crate::GraphData::try_from(snapshot)?))
+    }
+
     pub fn nodes(mut self, nodes: Vec<Node>) -> Self {
         self.data.nodes = nodes;
         self
@@ -781,7 +791,7 @@ impl GraphBuilder {
 /// GPUG's developer-facing graph view and orchestration entity.
 pub struct Graph {
     model: EditorModel,
-    layout_edges: Rc<[LayoutEdge]>,
+    layout_edges: gpug_data::column::FrozenColumn<LayoutEdge>,
     viewport: Viewport,
     renderer: GraphRenderer,
     layout: Box<dyn Layout>,
@@ -799,14 +809,13 @@ pub struct Graph {
     source_handle_position: Position,
     show_resize_handles: bool,
     pan_drag_position: Option<Point<Pixels>>,
-    pointer_over_graph_item: bool,
     pointer_over_handle: bool,
-    pointer_over_reconnect: bool,
     smooth_zoom: Option<SmoothZoom>,
     gestures: GestureRouter,
     selection_start: Option<Point<Pixels>>,
     selection_current: Option<Point<Pixels>>,
-    drag_nodes: Option<Vec<(usize, WorldPoint)>>,
+    drag_nodes: Option<Vec<(NodeId, WorldPoint)>>,
+    pending_node_drag: Option<WorldPoint>,
     temporary_edge_preview: Option<(WorldPoint, WorldPoint)>,
     focus: FocusHandle,
     connection: ConnectionController,
@@ -814,6 +823,7 @@ pub struct Graph {
     default_edge_marker_start: Option<EdgeMarker>,
     default_edge_marker_end: Option<EdgeMarker>,
     events: Vec<GraphEvent>,
+    selection_emission_revision: Option<(u64, u64, u64, u64)>,
     announcement: String,
     resize_node: Option<(usize, crate::NodeResizeControl)>,
     only_render_visible_elements: bool,
@@ -888,7 +898,8 @@ impl Graph {
     }
 
     fn from_builder(builder: GraphBuilder, cx: &mut App) -> Result<Self, GraphDataError> {
-        let layout_edges: Rc<[LayoutEdge]> = builder.data.compile_edges()?.into();
+        let layout_edges: gpug_data::column::FrozenColumn<LayoutEdge> =
+            builder.data.compile_edges()?.into();
         let next_edge_id = builder
             .data
             .edges
@@ -897,7 +908,8 @@ impl Graph {
             .max()
             .unwrap_or(0)
             .wrapping_add(1);
-        let model = EditorModel::new(builder.data.nodes, builder.data.edges, builder.ownership)?;
+        let model = EditorModel::new(builder.data.nodes, builder.data.edges, builder.ownership)?
+            .with_private_snapshot();
         builder.data_api.sync(&model.nodes, &model.edges);
         let synced_membership_revision = model.store.dirty.revisions.membership;
         let revisions = model.store.dirty.revisions;
@@ -922,14 +934,13 @@ impl Graph {
             source_handle_position: builder.source_handle_position,
             show_resize_handles: builder.show_resize_handles,
             pan_drag_position: None,
-            pointer_over_graph_item: false,
             pointer_over_handle: false,
-            pointer_over_reconnect: false,
             smooth_zoom: None,
             gestures: GestureRouter::default(),
             selection_start: None,
             selection_current: None,
             drag_nodes: None,
+            pending_node_drag: None,
             temporary_edge_preview: None,
             focus: cx.focus_handle().tab_stop(true),
             connection,
@@ -937,6 +948,7 @@ impl Graph {
             default_edge_marker_start: builder.default_edge_marker_start,
             default_edge_marker_end: builder.default_edge_marker_end,
             events: Vec::new(),
+            selection_emission_revision: None,
             announcement: String::new(),
             resize_node: None,
             only_render_visible_elements: builder.only_render_visible_elements,
@@ -986,6 +998,29 @@ impl Graph {
         self.layout_initialized = false;
         self.sim_tick = 0;
         Ok(())
+    }
+
+    /// Atomically install an analytical snapshot through the normal data reset
+    /// path. Ownership mode is retained; presentation state uses bridge defaults.
+    /// Convert on a worker with `GraphData::try_from` and use `set_data` to avoid
+    /// doing the conversion on the UI thread for large snapshots.
+    pub fn set_snapshot(
+        &mut self,
+        snapshot: &crate::GraphSnapshot,
+    ) -> Result<(), crate::BridgeError> {
+        Ok(self.set_data(GraphData::try_from(snapshot)?)?)
+    }
+
+    /// Capture current measured world geometry for worker-side analysis/storage.
+    /// Explicitly copies O(V + E) data; pending external edits are not committed.
+    pub fn capture_snapshot(&self) -> Result<crate::SnapshotCapture, crate::BridgeError> {
+        self.model.capture_snapshot()
+    }
+
+    /// Export a synchronous analytical snapshot, including current layout geometry.
+    /// Prefer `capture_snapshot` and worker-side index construction for large views.
+    pub fn snapshot(&self) -> Result<crate::GraphSnapshot, crate::BridgeError> {
+        self.model.snapshot()
     }
 
     pub fn replace_external(
@@ -1415,8 +1450,18 @@ impl Graph {
         if !edges.is_empty() {
             self.events.push(GraphEvent::EdgesChanged(edges));
         }
-        if self.model.store.dirty.peek().overlays {
+        // DirtySet remains available until the host takes it. Its overlay bit
+        // is not an event queue: repeatedly consuming it on motion would advance
+        // selection and rebuild the entire appearance cache every drag frame.
+        let r = self.model.store.dirty.revisions;
+        let revision = (r.selection, r.membership, r.node_specs, r.edge_specs);
+        if self.model.store.dirty.peek().overlays
+            && self.selection_emission_revision != Some(revision)
+        {
             self.emit_selection();
+            let r = self.model.store.dirty.revisions;
+            self.selection_emission_revision =
+                Some((r.selection, r.membership, r.node_specs, r.edge_specs));
         }
     }
 

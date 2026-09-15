@@ -140,8 +140,31 @@ pub fn edge_dtype() -> DType {
 /// Convert a validated snapshot to native Vortex struct arrays. Numeric data is
 /// columnar; strings remain separate from geometry and topology. O(V + E).
 pub fn graph_arrays(graph: &GraphSnapshot) -> Result<(ArrayRef, ArrayRef), VortexGraphError> {
-    let nodes = graph.nodes();
-    let edges = graph.edges();
+    let (nodes, edges) = graph.vortex_tables();
+    Ok((nodes.clone(), edges.clone()))
+}
+
+pub(crate) fn identity_buffers(
+    nodes: ArrayRef,
+    edges: ArrayRef,
+) -> Result<(vortex::buffer::Buffer<u64>, vortex::buffer::Buffer<u64>), VortexGraphError> {
+    let session = VortexSession::default();
+    let mut ctx = session.create_execution_ctx();
+    let mut ids = |table: ArrayRef| {
+        table
+            .execute::<StructArray>(&mut ctx)?
+            .unmasked_field_by_name("id")?
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)
+            .map(|array| array.to_buffer::<u64>())
+    };
+    Ok((ids(nodes)?, ids(edges)?))
+}
+
+pub(crate) fn arrays_from_rows(
+    nodes: &[Node],
+    edges: &[Edge],
+) -> Result<(ArrayRef, ArrayRef), VortexGraphError> {
     let nodes = StructArray::from_fields(&[
         (
             "id",
@@ -400,9 +423,18 @@ impl VortexGraphIo {
         nodes: ArrayRef,
         edges: ArrayRef,
     ) -> Result<GraphSnapshot, VortexGraphError> {
+        let (node_rows, edge_rows) = Self::rows_from_arrays(nodes, edges)?;
+        Ok(GraphSnapshot::new(node_rows, edge_rows)?)
+    }
+
+    pub(crate) fn rows_from_arrays(
+        nodes: ArrayRef,
+        edges: ArrayRef,
+    ) -> Result<(Vec<Node>, Vec<Edge>), VortexGraphError> {
         check_schema("nodes", nodes.dtype(), node_dtype())?;
         check_schema("edges", edges.dtype(), edge_dtype())?;
-        let mut ctx = self.session.create_execution_ctx();
+        let session = VortexSession::default();
+        let mut ctx = session.create_execution_ctx();
         let nodes = nodes.execute::<StructArray>(&mut ctx)?;
         let edges = edges.execute::<StructArray>(&mut ctx)?;
         // Schema checks above guarantee the physical buffer types and non-nullability.
@@ -477,7 +509,7 @@ impl VortexGraphIo {
                 },
             });
         }
-        Ok(GraphSnapshot::new(node_rows, edge_rows)?)
+        Ok((node_rows, edge_rows))
     }
 }
 

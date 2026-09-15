@@ -3,7 +3,7 @@
 //! One store owns one connection. Move it to a dedicated worker and keep all calls
 //! outside GPUI render/input handlers. The `gpug_data` schema belongs to this
 //! library; callers must not edit its tables through unrelated connections.
-#![doc = include_str!("../DUCKDB.md")]
+#![doc = include_str!("../docs/DUCKDB.md")]
 use crate::query::{Query, QuerySource};
 use crate::{Edge, EdgeId, GraphError, GraphSnapshot, Node, NodeId, WorldRect};
 use duckdb::{params, params_from_iter, Connection, Transaction};
@@ -65,7 +65,6 @@ pub enum StoreError {
     UnsupportedQuery,
     ResultLimitTooLarge,
     Cancelled,
-    #[cfg(feature = "vortex")]
     Vortex(Box<crate::vortex_io::VortexGraphError>),
 }
 impl fmt::Display for StoreError {
@@ -99,7 +98,6 @@ impl fmt::Display for StoreError {
                 write!(f, "result limit exceeds DuckDB signed LIMIT capacity")
             }
             Self::Cancelled => write!(f, "database query cancelled"),
-            #[cfg(feature = "vortex")]
             Self::Vortex(e) => write!(f, "vortex: {e}"),
         }
     }
@@ -110,7 +108,6 @@ impl std::error::Error for StoreError {
             Self::Io(e) => Some(e),
             Self::DuckDb(e) => Some(e.as_ref()),
             Self::Graph(e) => Some(e),
-            #[cfg(feature = "vortex")]
             Self::Vortex(e) => Some(e.as_ref()),
             _ => None,
         }
@@ -131,7 +128,6 @@ impl From<GraphError> for StoreError {
         Self::Graph(e)
     }
 }
-#[cfg(feature = "vortex")]
 impl From<crate::vortex_io::VortexGraphError> for StoreError {
     fn from(e: crate::vortex_io::VortexGraphError) -> Self {
         Self::Vortex(Box::new(e))
@@ -527,7 +523,6 @@ impl DuckDbStore {
 
     /// Decode native Vortex files before opening the database write transaction.
     /// Invalid files cannot replace the previously committed graph.
-    #[cfg(feature = "vortex")]
     pub async fn import_vortex(
         &mut self,
         io: &crate::vortex_io::VortexGraphIo,
@@ -542,7 +537,6 @@ impl DuckDbStore {
     /// Export a consistent database snapshot as two native compressed Vortex files.
     /// The returned revision identifies the exported generation. Call on a worker:
     /// the snapshot load is synchronous even though compression/file encoding awaits.
-    #[cfg(feature = "vortex")]
     pub async fn export_vortex(
         &mut self,
         io: &crate::vortex_io::VortexGraphIo,

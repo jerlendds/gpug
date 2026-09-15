@@ -71,3 +71,10 @@ pub use crate::node_ui::{
 pub use crate::performance::{
     DetailGovernor, DirtySet, DirtyTracker, GeometryCache, Revisions, VisibilityIndex,
 };
+
+/// Framework-neutral snapshots, indexed analytics, queries, spatial planning and workers.
+/// Vortex is required; DuckDB IO requires its opt-in Cargo feature.
+pub use gpug_data as analysis;
+pub use gpug_data::GraphSnapshot;
+pub mod gpug_bridge;
+pub use gpug_bridge::{BridgeError, SnapshotCapture};

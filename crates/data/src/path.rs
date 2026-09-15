@@ -88,9 +88,9 @@ impl PathWorkspace {
         if budget.max_nodes == 0 {
             return Ok(self.result(PathStatus::Stopped(PathStop::NodeBudget), 0));
         }
-        self.marks.resize(graph.nodes().len(), 0);
-        self.parents.resize(graph.nodes().len(), 0);
-        self.parent_edges.resize(graph.nodes().len(), 0);
+        self.marks.resize(graph.node_count(), 0);
+        self.parents.resize(graph.node_count(), 0);
+        self.parent_edges.resize(graph.node_count(), 0);
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
             self.marks.fill(0);
@@ -156,12 +156,12 @@ impl PathWorkspace {
                     self.edges.clear();
                     return Ok(self.result(PathStatus::Stopped(PathStop::Cancelled), examined));
                 }
-                self.nodes.push(graph.nodes()[node as usize].id);
+                self.nodes.push(graph.node_id(node as usize));
                 if node == start {
                     break;
                 }
                 self.edges
-                    .push(graph.edges()[self.parent_edges[node as usize] as usize].id);
+                    .push(graph.edge_id(self.parent_edges[node as usize] as usize));
                 node = self.parents[node as usize];
             }
             self.nodes.reverse();

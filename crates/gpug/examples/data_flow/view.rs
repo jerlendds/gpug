@@ -1,5 +1,7 @@
 use super::*;
-use gpug_data::worker::{ClientId, GraphQueryTask, QueryWorker, Ticket, WorkStamp, WorkerError};
+use gpug::analysis::worker::{
+    ClientId, GraphQueryTask, QueryWorker, Ticket, WorkStamp, WorkerError,
+};
 use gpui::{Context, Entity, Render, Window};
 use std::time::Duration;
 

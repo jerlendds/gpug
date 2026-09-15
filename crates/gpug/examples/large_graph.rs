@@ -20,9 +20,9 @@ fn env<T: std::str::FromStr>(key: &str, fallback: T) -> T {
 }
 
 fn main() {
-    let node_count = env("GPUG_NODE_COUNT", 1_000usize);
+    let node_count = env("GPUG_NODE_COUNT", 10_000usize);
     let probability = env("GPUG_EDGE_PROBABILITY", 0.00001f64);
-    let edge_budget = env("GPUG_EDGE_BUDGET", 20_000usize);
+    let edge_budget = env("GPUG_EDGE_BUDGET", 40_000usize);
     let animate = env("GPUG_ANIMATE", 1u32) != 0;
     support::Application::new().run(move |cx: &mut App| {
         let options = WindowOptions {

@@ -1,11 +1,11 @@
 //! Query an analytical graph and display its source identities as custom GPUI cards.
-//! cargo run -p gpug-data --features gpug --example data_flow
-use gpug::{Graph, GraphRenderer, GraphStyle, Viewport, WorldBounds, WorldPoint, WorldSize};
-use gpug_data::{
-    gpug_bridge,
+//! cargo run -p gpug --example data_flow
+use gpug::analysis::{
     query::{Query, QueryBudget, QueryWorkspace},
     Edge, GraphSnapshot, Node, WorldRect,
 };
+use gpug::gpug_bridge;
+use gpug::{Graph, GraphRenderer, GraphStyle, Viewport, WorldBounds, WorldPoint, WorldSize};
 use gpui::{
     div, point, prelude::*, px, rgb, App, AppContext, Application, MouseButton, WindowOptions,
 };
